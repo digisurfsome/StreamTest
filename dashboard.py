@@ -562,16 +562,108 @@ def edit_mode():
 # TEST MODE - Test existing app
 # =============================================================================
 
+def analyze_code_with_claude(client, code: str, test_steps: str) -> dict:
+    """Use Claude to analyze code for issues."""
+    prompt = f"""You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
+
+1. **Syntax Errors** - Any code that won't run
+2. **Logic Bugs** - Incorrect behavior, edge cases
+3. **Security Issues** - SQL injection, XSS, exposed secrets
+4. **Best Practices** - Missing error handling, poor UX
+5. **Test Scenarios** - Based on the test steps provided
+
+CODE TO ANALYZE:
+```python
+{code}
+```
+
+TEST STEPS TO VERIFY:
+{test_steps}
+
+Respond in this exact JSON format:
+{{
+    "syntax_valid": true/false,
+    "overall_score": 0-100,
+    "issues": [
+        {{
+            "severity": "critical|high|medium|low",
+            "category": "syntax|logic|security|best_practice",
+            "line": "approximate line number or 'N/A'",
+            "description": "What's wrong",
+            "fix": "How to fix it"
+        }}
+    ],
+    "test_results": [
+        {{
+            "step": "Test step description",
+            "status": "pass|fail|warning",
+            "notes": "Details"
+        }}
+    ],
+    "summary": "Overall assessment"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception as e:
+        st.error(f"Analysis error: {e}")
+
+    return {"syntax_valid": False, "overall_score": 0, "issues": [], "summary": "Analysis failed"}
+
+
+def auto_fix_issues(client, code: str, issues: list) -> str:
+    """Have Claude fix the identified issues."""
+    prompt = f"""Fix the following issues in this code. Return ONLY the corrected Python code.
+
+CURRENT CODE:
+```python
+{code}
+```
+
+ISSUES TO FIX:
+{json.dumps(issues, indent=2)}
+
+Return the complete fixed code, no explanations."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=8000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        if "```python" in result:
+            result = result.split("```python")[1].split("```")[0]
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0]
+
+        return result.strip()
+    except Exception as e:
+        st.error(f"Fix error: {e}")
+        return code
+
+
 def test_mode():
-    """Test pre-built app only."""
+    """Test pre-built app with Claude analysis."""
     st.header("🧪 Test Only")
 
     st.markdown("""
-    Select a project to test. The auto-loop will:
-    1. Run the app
-    2. Execute test steps
-    3. Fix any issues found
-    4. Repeat until passing
+    **Automated Code Analysis & Fix Loop**:
+    1. Claude analyzes your code for issues
+    2. Shows problems with severity ratings
+    3. Auto-fixes issues if requested
+    4. Re-analyzes until passing
     """)
 
     # Project selection
@@ -589,7 +681,6 @@ def test_mode():
         uploaded_file = st.file_uploader("Or upload .py file", type=["py"])
 
     if uploaded_file:
-        # Save uploaded file to temp project
         project_name = uploaded_file.name.replace(".py", "")
         project_dir = PROJECTS_DIR / project_name
         project_dir.mkdir(exist_ok=True)
@@ -611,36 +702,122 @@ def test_mode():
         st.error(f"No app.py found in {project_dir}")
         return
 
+    current_code = app_file.read_text(encoding="utf-8")
+
     with st.expander("View code"):
-        st.code(app_file.read_text(encoding="utf-8"), language="python")
+        st.code(current_code, language="python")
 
     # Test configuration
     st.subheader("Test Configuration")
 
     test_steps = st.text_area(
-        "Test steps (one per line)",
-        value="Verify the page loads without errors\nCheck all buttons are clickable\nTest basic functionality",
+        "Test scenarios (one per line)",
+        value="Page loads without errors\nAll UI elements render correctly\nButtons and inputs are functional\nNo security vulnerabilities",
         height=100
     )
 
-    max_loops = st.slider("Max fix attempts", 1, 20, 10)
+    col_a, col_b = st.columns(2)
+    with col_a:
+        max_loops = st.slider("Max fix attempts", 1, 10, 5)
+    with col_b:
+        auto_fix = st.checkbox("Auto-fix issues", value=True)
 
-    if st.button("🚀 Start Testing", type="primary"):
+    if st.button("🚀 Start Analysis", type="primary"):
+        client = get_client()
+        if not client:
+            return
+
         st.session_state.current_project = selected_project
         st.session_state.status = "testing"
         add_log(f"Starting test: {selected_project}")
 
-        # TODO: Integrate with auto_loop.py
-        st.info("Testing integration coming soon!")
-        st.write("For now, run manually:")
-        st.code(f"""
-# Terminal 1: Start the app
-cd {project_dir}
-streamlit run app.py
+        code_to_test = current_code
+        loop_count = 0
 
-# Terminal 2: Run tests
-python auto_loop.py
-""")
+        while loop_count < max_loops:
+            loop_count += 1
+            st.subheader(f"📊 Analysis Loop {loop_count}/{max_loops}")
+
+            with st.spinner(f"Claude analyzing code (attempt {loop_count})..."):
+                analysis = analyze_code_with_claude(client, code_to_test, test_steps)
+
+            # Display score
+            score = analysis.get("overall_score", 0)
+            if score >= 90:
+                st.success(f"✅ Score: {score}/100 - Excellent!")
+            elif score >= 70:
+                st.warning(f"⚠️ Score: {score}/100 - Needs improvement")
+            else:
+                st.error(f"❌ Score: {score}/100 - Significant issues")
+
+            st.progress(score / 100)
+
+            # Display issues
+            issues = analysis.get("issues", [])
+            if issues:
+                st.write(f"**Found {len(issues)} issue(s):**")
+
+                for issue in issues:
+                    severity = issue.get("severity", "low")
+                    icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(severity, "⚪")
+
+                    with st.expander(f"{icon} [{severity.upper()}] {issue.get('description', 'Unknown')[:50]}..."):
+                        st.write(f"**Category:** {issue.get('category', 'N/A')}")
+                        st.write(f"**Line:** {issue.get('line', 'N/A')}")
+                        st.write(f"**Description:** {issue.get('description', 'N/A')}")
+                        st.write(f"**Fix:** {issue.get('fix', 'N/A')}")
+
+            # Display test results
+            test_results = analysis.get("test_results", [])
+            if test_results:
+                st.write("**Test Results:**")
+                for test in test_results:
+                    status = test.get("status", "unknown")
+                    icon = {"pass": "✅", "fail": "❌", "warning": "⚠️"}.get(status, "❓")
+                    st.write(f"{icon} {test.get('step', 'Unknown')} - {test.get('notes', '')}")
+
+            st.write(f"**Summary:** {analysis.get('summary', 'N/A')}")
+
+            # Check if passing
+            critical_issues = [i for i in issues if i.get("severity") in ["critical", "high"]]
+
+            if score >= 90 and not critical_issues:
+                st.success("🎉 Code passed all checks!")
+                st.session_state.status = "passed"
+                add_log(f"Test PASSED: {selected_project} (score: {score})")
+                break
+
+            # Auto-fix if enabled
+            if auto_fix and issues and loop_count < max_loops:
+                st.info("🔧 Auto-fixing issues...")
+
+                with st.spinner("Claude fixing code..."):
+                    fixed_code = auto_fix_issues(client, code_to_test, issues)
+
+                if fixed_code != code_to_test:
+                    code_to_test = fixed_code
+
+                    # Save fixed code
+                    app_file.write_text(fixed_code, encoding="utf-8")
+                    add_log(f"Applied fixes (loop {loop_count})")
+
+                    with st.expander("View fixed code"):
+                        st.code(fixed_code, language="python")
+
+                    st.success("✅ Fixes applied, re-analyzing...")
+                    continue
+                else:
+                    st.warning("No changes made by auto-fix")
+                    break
+            else:
+                if not auto_fix:
+                    st.info("Auto-fix disabled. Enable to automatically fix issues.")
+                break
+
+        # Final status
+        if st.session_state.status != "passed":
+            st.session_state.status = "failed"
+            add_log(f"Test completed with issues: {selected_project}")
 
 
 # =============================================================================
