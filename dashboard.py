@@ -705,14 +705,15 @@ def render_sidebar():
                 "application/json"
             )
 
-        uploaded_state = st.file_uploader("📤 Import State", type=["json"])
-        if uploaded_state:
-            try:
-                state = json.loads(uploaded_state.read().decode("utf-8"))
-                st.session_state.logs = state.get("logs", [])
-                st.success("State imported!")
-            except Exception as e:
-                st.error(f"Error importing: {e}")
+        with st.expander("📤 Import State"):
+            uploaded_state = st.file_uploader("Upload JSON", type=["json"], key="import_state")
+            if uploaded_state:
+                try:
+                    state = json.loads(uploaded_state.read().decode("utf-8"))
+                    st.session_state.logs = state.get("logs", [])
+                    st.success("State imported!")
+                except Exception as e:
+                    st.error(f"Error importing: {e}")
 
 
 # =============================================================================
