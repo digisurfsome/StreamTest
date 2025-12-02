@@ -85,7 +85,7 @@ def main():
     print("--- Test 1: Basic Text Generation ---")
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-04-17",
+            model="gemini-2.5-flash",
             contents="Say 'Hello from StreamTest!' exactly."
         )
         print(f"✅ Response: {response.text.strip()}")
@@ -103,7 +103,7 @@ def main():
     print("--- Test 2: Computer Use Tool ---")
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-04-17",
+            model="gemini-2.5-flash",
             contents="If you were looking at a webpage with a blue 'Submit' button, what action would you take to click it?",
             config=types.GenerateContentConfig(
                 tools=[

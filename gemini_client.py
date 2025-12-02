@@ -11,8 +11,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Gemini Computer Use model
-MODEL_ID = "gemini-2.5-flash-preview-04-17"
+# Gemini model - use stable version (no preview suffix)
+MODEL_ID = "gemini-2.5-flash"
 
 
 class GeminiClient:
