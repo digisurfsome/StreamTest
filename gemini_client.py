@@ -12,7 +12,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # Gemini Computer Use model
-MODEL_ID = "gemini-2.5-flash-preview-05-20"
+MODEL_ID = "gemini-2.5-flash-preview-04-17"
 
 
 class GeminiClient:
