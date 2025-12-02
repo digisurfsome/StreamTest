@@ -20,14 +20,49 @@ class GeminiClient:
 
     This client handles sending screenshots and instructions to the Gemini API
     and parsing the responses to extract actions for browser automation.
+
+    Supports both Vertex AI (recommended) and AI Studio API key authentication.
     """
 
     def __init__(self) -> None:
-        """Initialize the Gemini client with API credentials."""
-        self.client = genai.Client(api_key=config.GEMINI_API_KEY)
+        """Initialize the Gemini client with appropriate credentials.
+
+        For Vertex AI: Uses GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT,
+                       GOOGLE_CLOUD_LOCATION, and GOOGLE_GENAI_USE_VERTEXAI env vars.
+        For AI Studio: Uses GEMINI_API_KEY env var.
+        """
+        auth_mode = config.get_auth_mode()
+
+        if auth_mode == "vertex_ai":
+            # Vertex AI mode - SDK reads from environment variables:
+            # GOOGLE_GENAI_USE_VERTEXAI=true
+            # GOOGLE_CLOUD_PROJECT=your-project
+            # GOOGLE_CLOUD_LOCATION=us-central1
+            # GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+            self.client = genai.Client(
+                vertexai=True,
+                project=config.GOOGLE_CLOUD_PROJECT,
+                location=config.GOOGLE_CLOUD_LOCATION,
+            )
+            logger.info(
+                f"GeminiClient initialized with Vertex AI "
+                f"(project: {config.GOOGLE_CLOUD_PROJECT}, "
+                f"location: {config.GOOGLE_CLOUD_LOCATION})"
+            )
+        elif auth_mode == "api_key":
+            # AI Studio mode - uses API key
+            self.client = genai.Client(api_key=config.GEMINI_API_KEY)
+            logger.info("GeminiClient initialized with AI Studio API key")
+        else:
+            raise ValueError(
+                "No authentication configured! Set either:\n"
+                "  - Vertex AI: GOOGLE_GENAI_USE_VERTEXAI=true, GOOGLE_CLOUD_PROJECT, "
+                "GOOGLE_APPLICATION_CREDENTIALS\n"
+                "  - AI Studio: GEMINI_API_KEY"
+            )
+
         self._max_retries = 3
         self._base_delay = 1.0
-        logger.info("GeminiClient initialized")
 
     async def get_action(
         self, screenshot_bytes: bytes, instruction: str

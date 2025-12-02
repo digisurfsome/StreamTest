@@ -9,7 +9,17 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-# Gemini API Configuration
+# ===========================================
+# Vertex AI Configuration (Recommended)
+# ===========================================
+USE_VERTEX_AI: bool = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").lower() == "true"
+GOOGLE_CLOUD_PROJECT: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+
+# ===========================================
+# Alternative: AI Studio API Key
+# ===========================================
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 # Target Application Configuration
@@ -50,6 +60,20 @@ def setup_logging(level: str | None = None) -> None:
         level=getattr(logging, log_level.upper(), logging.INFO),
         format=LOG_FORMAT,
     )
+
+
+def get_auth_mode() -> str:
+    """Return which authentication mode is configured.
+
+    Returns:
+        'vertex_ai' if Vertex AI is configured, 'api_key' if API key is set,
+        or 'none' if neither is configured.
+    """
+    if USE_VERTEX_AI and GOOGLE_CLOUD_PROJECT:
+        return "vertex_ai"
+    elif GEMINI_API_KEY:
+        return "api_key"
+    return "none"
 
 
 # Initialize logging on module import
