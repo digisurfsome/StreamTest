@@ -52,7 +52,8 @@ def get_client():
     """Get Anthropic client."""
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        st.error("ANTHROPIC_API_KEY not set in .env file!")
+        st.error("ANTHROPIC_API_KEY not found in environment!")
+        st.info("For Railway: Go to Settings → Shared Variables → ensure it's linked to 'web' service, then redeploy")
         return None
     return Anthropic(api_key=api_key)
 
