@@ -13,6 +13,7 @@ All modes feed into the auto-test-fix loop.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -189,19 +190,172 @@ The code should be ready to run with: streamlit run app.py
 
 
 # =============================================================================
+# MULTI-AGENT CODE REVIEW SYSTEM
+# =============================================================================
+
+def create_edit_snippets(client, current_code: str, feature_description: str, edit_rules: str) -> dict:
+    """First Claude instance: Create edit snippets without touching code."""
+    prompt = f"""You are an expert Python developer. Analyze this code and create EDIT SNIPPETS for the requested feature.
+
+CURRENT CODE:
+```python
+{current_code}
+```
+
+FEATURE TO ADD:
+{feature_description}
+
+RULES:
+{edit_rules}
+
+DO NOT provide the full updated code yet. Instead, create a detailed EDIT PLAN with specific snippets.
+
+Respond in this exact JSON format:
+{{
+    "analysis": "Brief explanation of what needs to change",
+    "snippets": [
+        {{
+            "location": "Description of where in the code (e.g., 'after imports', 'inside main function')",
+            "action": "add|modify|delete",
+            "original_code": "The exact code being modified (if modify/delete)",
+            "new_code": "The new/replacement code",
+            "reason": "Why this change is needed"
+        }}
+    ]
+}}
+
+Be precise and surgical. Only include changes needed for the feature."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        # Extract JSON
+        import re
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception as e:
+        st.error(f"Error creating snippets: {e}")
+
+    return {"analysis": "Failed to create snippets", "snippets": []}
+
+
+def judge_snippets(client, current_code: str, feature_description: str, snippets: dict, judge_id: int) -> dict:
+    """Judge instance: Review snippets and provide verdict."""
+    prompt = f"""You are Code Review Judge #{judge_id}. Review these proposed code changes.
+
+ORIGINAL CODE:
+```python
+{current_code}
+```
+
+REQUESTED FEATURE:
+{feature_description}
+
+PROPOSED EDIT SNIPPETS:
+{json.dumps(snippets, indent=2)}
+
+Review each snippet and provide your judgment. Consider:
+1. Will this correctly implement the feature?
+2. Does it follow the surgical edit principle (minimal changes)?
+3. Are there any bugs or issues?
+4. Is anything missing?
+
+Respond in this exact JSON format:
+{{
+    "judge_id": {judge_id},
+    "overall_verdict": "APPROVE|REJECT|NEEDS_REVISION",
+    "confidence": 0.0-1.0,
+    "snippet_reviews": [
+        {{
+            "snippet_index": 0,
+            "verdict": "APPROVE|REJECT|NEEDS_REVISION",
+            "issue": "Description of any issue (or null if approved)",
+            "suggestion": "Suggested fix (or null if approved)"
+        }}
+    ],
+    "summary": "Overall assessment"
+}}"""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        import re
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+    except Exception as e:
+        st.error(f"Judge {judge_id} error: {e}")
+
+    return {"judge_id": judge_id, "overall_verdict": "ERROR", "summary": "Failed to review"}
+
+
+def apply_vetted_snippets(client, current_code: str, snippets: dict, judge_feedback: list) -> str:
+    """Original Claude: Apply vetted changes considering judge feedback."""
+    prompt = f"""You are the original code editor. Apply the vetted edit snippets to the code.
+
+ORIGINAL CODE:
+```python
+{current_code}
+```
+
+APPROVED SNIPPETS:
+{json.dumps(snippets, indent=2)}
+
+JUDGE FEEDBACK:
+{json.dumps(judge_feedback, indent=2)}
+
+Apply all approved changes. If judges suggested improvements, incorporate them.
+Return ONLY the complete updated Python code, no explanations."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=8000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        # Clean up code
+        if "```python" in result:
+            result = result.split("```python")[1].split("```")[0]
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0]
+
+        return result.strip()
+    except Exception as e:
+        st.error(f"Error applying changes: {e}")
+        return current_code
+
+
+# =============================================================================
 # EDIT MODE - Add features to existing app
 # =============================================================================
 
 def edit_mode():
-    """Edit/add features to existing app."""
+    """Edit/add features to existing app with multi-agent review."""
     st.header("✏️ Edit / Add Features")
 
     st.markdown("""
-    **Surgery Mode**: Only modify what's necessary. Keep everything else intact.
+    **Multi-Agent Surgery Mode**:
 
-    1. Select or upload existing code
-    2. Describe the feature to add
-    3. Review planned changes BEFORE applying
+    1. **Editor Claude** creates edit snippets (pre-plan)
+    2. **Judge 1 & Judge 2** review the snippets independently
+    3. **2-to-1 Vote** determines if changes proceed
+    4. **Editor Claude** applies vetted changes
     """)
 
     # Project selection
@@ -264,113 +418,144 @@ def edit_mode():
     col1, col2 = st.columns(2)
 
     with col1:
-        plan_button = st.button("📋 Plan Changes First", disabled=not feature_description)
+        plan_button = st.button("📋 Create & Review Snippets", disabled=not feature_description)
 
     with col2:
-        apply_button = st.button("⚡ Plan & Apply", type="primary", disabled=not feature_description)
+        apply_button = st.button("⚡ Full Multi-Agent Review", type="primary", disabled=not feature_description)
 
     client = get_client()
     if not client:
         return
 
     if plan_button or apply_button:
-        with st.spinner("Analyzing code and planning changes..."):
-            plan_prompt = f"""You are an expert Python developer performing SURGICAL code edits.
+        # Step 1: Editor Claude creates snippets
+        st.subheader("🔧 Step 1: Editor Claude Creating Snippets...")
+        with st.spinner("Editor analyzing code and creating edit plan..."):
+            snippets = create_edit_snippets(client, current_code, feature_description, edit_rules)
 
-CURRENT CODE:
-```python
-{current_code}
-```
+        if not snippets.get("snippets"):
+            st.error("Failed to create edit snippets")
+            return
 
-FEATURE TO ADD:
-{feature_description}
+        # Display snippets
+        st.success(f"✅ Created {len(snippets['snippets'])} edit snippet(s)")
+        st.write(f"**Analysis:** {snippets.get('analysis', 'N/A')}")
 
-RULES (STRICT):
-{edit_rules}
+        with st.expander("📝 View Edit Snippets", expanded=True):
+            for i, snippet in enumerate(snippets["snippets"]):
+                st.markdown(f"**Snippet {i+1}:** {snippet.get('location', 'Unknown location')}")
+                st.markdown(f"- Action: `{snippet.get('action', 'unknown')}`")
+                st.markdown(f"- Reason: {snippet.get('reason', 'N/A')}")
+                if snippet.get("new_code"):
+                    st.code(snippet["new_code"], language="python")
+                st.divider()
 
-First, analyze the code and list EXACTLY what changes need to be made.
-Format your response as:
+        if plan_button and not apply_button:
+            st.info("👆 Click 'Full Multi-Agent Review' to have judges review and apply these changes")
+            # Store snippets in session state for later use
+            st.session_state.pending_snippets = snippets
+            st.session_state.pending_code = current_code
+            st.session_state.pending_feature = feature_description
+            st.session_state.pending_project = project_name
+            return
 
-ANALYSIS:
-[Brief explanation of what needs to change]
+        # Step 2: Two judges review independently
+        st.subheader("⚖️ Step 2: Judge Review (2 Independent Reviewers)")
 
-PLANNED CHANGES:
-1. [File section] - [What will be added/modified]
-2. [File section] - [What will be added/modified]
-...
+        col_j1, col_j2 = st.columns(2)
 
-Then provide the complete updated code.
+        with col_j1:
+            with st.spinner("Judge 1 reviewing..."):
+                judge1_result = judge_snippets(client, current_code, feature_description, snippets, 1)
 
-UPDATED CODE:
-```python
-[complete updated code here]
-```
-"""
+        with col_j2:
+            with st.spinner("Judge 2 reviewing..."):
+                judge2_result = judge_snippets(client, current_code, feature_description, snippets, 2)
 
-            try:
-                response = client.messages.create(
-                    model=CLAUDE_MODEL,
-                    max_tokens=8000,
-                    messages=[{"role": "user", "content": plan_prompt}]
-                )
+        # Display judge verdicts
+        with col_j1:
+            verdict1 = judge1_result.get("overall_verdict", "ERROR")
+            icon1 = "✅" if verdict1 == "APPROVE" else "⚠️" if verdict1 == "NEEDS_REVISION" else "❌"
+            st.markdown(f"### {icon1} Judge 1: {verdict1}")
+            st.write(judge1_result.get("summary", "No summary"))
+            confidence1 = judge1_result.get("confidence", 0)
+            st.progress(confidence1, text=f"Confidence: {confidence1:.0%}")
 
-                result = response.content[0].text
+        with col_j2:
+            verdict2 = judge2_result.get("overall_verdict", "ERROR")
+            icon2 = "✅" if verdict2 == "APPROVE" else "⚠️" if verdict2 == "NEEDS_REVISION" else "❌"
+            st.markdown(f"### {icon2} Judge 2: {verdict2}")
+            st.write(judge2_result.get("summary", "No summary"))
+            confidence2 = judge2_result.get("confidence", 0)
+            st.progress(confidence2, text=f"Confidence: {confidence2:.0%}")
 
-                # Extract analysis and planned changes
-                if "ANALYSIS:" in result:
-                    analysis = result.split("ANALYSIS:")[1].split("PLANNED CHANGES:")[0].strip()
-                    st.subheader("📊 Analysis")
-                    st.write(analysis)
+        # Step 3: Voting
+        st.subheader("🗳️ Step 3: Vote Tally")
 
-                if "PLANNED CHANGES:" in result:
-                    changes = result.split("PLANNED CHANGES:")[1].split("UPDATED CODE:")[0].strip()
-                    st.subheader("📋 Planned Changes")
-                    st.markdown(changes)
+        approvals = sum(1 for v in [verdict1, verdict2] if v == "APPROVE")
+        rejections = sum(1 for v in [verdict1, verdict2] if v == "REJECT")
+        revisions = sum(1 for v in [verdict1, verdict2] if v == "NEEDS_REVISION")
 
-                # Extract new code
-                new_code = ""
-                if "```python" in result:
-                    code_parts = result.split("```python")
-                    if len(code_parts) > 1:
-                        new_code = code_parts[-1].split("```")[0].strip()
+        st.write(f"- ✅ Approvals: {approvals}")
+        st.write(f"- ⚠️ Needs Revision: {revisions}")
+        st.write(f"- ❌ Rejections: {rejections}")
 
-                if new_code and apply_button:
-                    # Save the updated code
-                    project_dir = PROJECTS_DIR / project_name
-                    project_dir.mkdir(exist_ok=True)
+        # Determine outcome
+        if rejections >= 2:
+            st.error("❌ **REJECTED** - Both judges rejected the changes. Please revise your feature description.")
+            add_log(f"Edit rejected by judges: {feature_description[:30]}...")
+            return
 
-                    # Backup original
-                    backup_file = project_dir / f"app_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
-                    backup_file.write_text(current_code, encoding="utf-8")
+        proceed = approvals >= 1 or (approvals + revisions >= 2 and rejections == 0)
 
-                    # Write new code
-                    app_file = project_dir / "app.py"
-                    app_file.write_text(new_code, encoding="utf-8")
+        if proceed:
+            st.success("✅ **APPROVED** - Proceeding with changes (incorporating feedback)")
 
-                    save_project_state(project_name, {
-                        "name": project_name,
-                        "description": feature_description,
-                        "mode": "edit",
-                        "files": ["app.py"],
-                    })
+            # Step 4: Apply vetted changes
+            st.subheader("🚀 Step 4: Applying Vetted Changes")
 
-                    st.success("✅ Changes applied!")
-                    add_log(f"Applied feature: {feature_description[:50]}...")
+            judge_feedback = [judge1_result, judge2_result]
 
-                    with st.expander("View updated code"):
-                        st.code(new_code, language="python")
+            with st.spinner("Editor Claude applying approved changes..."):
+                new_code = apply_vetted_snippets(client, current_code, snippets, judge_feedback)
 
-                    st.session_state.current_project = project_name
-                    st.session_state.status = "ready_to_test"
+            if new_code and new_code != current_code:
+                # Save the updated code
+                project_dir = PROJECTS_DIR / project_name
+                project_dir.mkdir(exist_ok=True)
 
-                elif new_code and plan_button:
-                    st.subheader("🔍 Preview Updated Code")
+                # Backup original
+                backup_file = project_dir / f"app_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
+                backup_file.write_text(current_code, encoding="utf-8")
+
+                # Write new code
+                app_file = project_dir / "app.py"
+                app_file.write_text(new_code, encoding="utf-8")
+
+                save_project_state(project_name, {
+                    "name": project_name,
+                    "description": feature_description,
+                    "mode": "edit",
+                    "files": ["app.py"],
+                    "review": {
+                        "judge1": verdict1,
+                        "judge2": verdict2,
+                        "snippets_count": len(snippets["snippets"]),
+                    }
+                })
+
+                st.success("✅ Changes applied successfully!")
+                add_log(f"Multi-agent edit: {feature_description[:50]}...")
+
+                with st.expander("View updated code"):
                     st.code(new_code, language="python")
-                    st.info("Click 'Plan & Apply' to save these changes")
 
-            except Exception as e:
-                st.error(f"Error: {e}")
-                add_log(f"Edit error: {e}")
+                st.session_state.current_project = project_name
+                st.session_state.status = "ready_to_test"
+            else:
+                st.warning("⚠️ No changes were made to the code")
+        else:
+            st.warning("⚠️ **NEEDS REVISION** - Please refine your feature description based on judge feedback")
 
 
 # =============================================================================
