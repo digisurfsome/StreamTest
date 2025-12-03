@@ -35,6 +35,50 @@ CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_HAIKU = "claude-3-5-haiku-20241022"  # Fast & cheap for simple fixes
 
 # =============================================================================
+# APP MODE CONFIGURATION - Toggle between full app vs simple MVP expectations
+# =============================================================================
+APP_MODES = {
+    "full_app": {
+        "name": "Full App (Database + Auth)",
+        "description": "Enterprise-ready with database, authentication, user management",
+        "prompt_modifier": """
+APP CONTEXT: This is a FULL APPLICATION with database and authentication.
+- Expect proper database integration (PostgreSQL, SQLite, etc.)
+- Session data that needs persistence MUST be stored in database
+- PIN/authentication attempts MUST be stored in database to prevent bypass
+- Proper user management and authentication is expected
+- Rate limiting and security measures should be robust
+"""
+    },
+    "simple_mvp": {
+        "name": "Simple MVP (No Database)",
+        "description": "Personal testing/MVP with JSON file save/load for data",
+        "prompt_modifier": """
+APP CONTEXT: This is a SIMPLE MVP without a database - THIS IS INTENTIONAL.
+- No database is expected or required - this is by design
+- Data persistence via JSON file upload/download is ACCEPTABLE and CORRECT
+- Session state for temporary data is FINE for this use case
+- Simple PIN in session state is ACCEPTABLE for personal MVP testing
+- Focus on functionality over enterprise security
+- DO NOT flag lack of database as an issue - it's intentional
+- DO NOT require authentication/user management for simple MVPs
+"""
+    },
+    "prototype": {
+        "name": "Prototype (Experimental)",
+        "description": "Early stage testing, may have rough edges",
+        "prompt_modifier": """
+APP CONTEXT: This is an EARLY PROTOTYPE for experimental testing.
+- Code may be rough/incomplete - focus on critical issues only
+- Skip minor style/best practice issues unless they cause bugs
+- No database or persistence expected
+- Security is minimal - this is for personal experimentation only
+- Only flag issues that would BREAK functionality
+"""
+    }
+}
+
+# =============================================================================
 # CODING STANDARDS - The "Coding Bible" reference for all prompts
 # =============================================================================
 CODING_STANDARDS = """
@@ -145,6 +189,16 @@ def init_session_state():
         "analysis_complete": False,  # Flag to show results section
         "tested_project": None,  # Project name that was tested
         "test_loop_count": 0,  # Number of loops completed
+        # APP MODE: Toggle between full app vs simple MVP expectations
+        "app_mode": "simple_mvp",  # Default to simple MVP (most common use case)
+        # TRACKING: Monitor what mechanisms are being used
+        "coding_bible_used": False,  # Track if coding standards were referenced
+        "voting_used": False,  # Track if multi-agent voting was used
+        "batch_fixes_count": 0,  # Track how many batch fixes happened
+        "haiku_fixes_count": 0,  # Track Haiku usage
+        "opus_fixes_count": 0,  # Track Opus usage
+        "verification_passes": 0,  # Track successful verifications
+        "verification_fails": 0,  # Track failed verifications
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -666,8 +720,11 @@ def edit_mode():
 # TEST MODE - Test existing app
 # =============================================================================
 
-def analyze_code_with_claude(client, code: str, test_steps: str, previous_issues: list = None) -> dict:
+def analyze_code_with_claude(client, code: str, test_steps: str, previous_issues: list = None, app_mode: str = "simple_mvp") -> dict:
     """Use Claude to analyze code for issues."""
+
+    # Track that we're using the coding bible
+    st.session_state.coding_bible_used = True
 
     previous_context = ""
     if previous_issues:
@@ -677,6 +734,9 @@ Check if they are ACTUALLY FIXED now. Don't report them again if fixed:
 {json.dumps(previous_issues, indent=2)}
 """
 
+    # Get app mode context - CRITICAL for proper judgment
+    app_mode_context = APP_MODES.get(app_mode, APP_MODES["simple_mvp"])["prompt_modifier"]
+
     prompt = f"""You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
 
 1. **Syntax Errors** - Any code that won't run
@@ -684,6 +744,10 @@ Check if they are ACTUALLY FIXED now. Don't report them again if fixed:
 3. **Security Issues** - SQL injection, XSS, exposed secrets
 4. **Best Practices** - Missing error handling, poor UX
 5. **Test Scenarios** - Based on the test steps provided
+
+{app_mode_context}
+
+{CODING_STANDARDS}
 {previous_context}
 CODE TO ANALYZE:
 ```python
@@ -978,6 +1042,134 @@ Respond in JSON:
     return True, "Verification check could not be completed"
 
 
+def multi_agent_vote(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str, dict]:
+    """
+    MULTI-AGENT VOTING SYSTEM: Three Opus instances vote on whether fix is good.
+
+    Agent 1: Reviews the fix
+    Agent 2: Reviews the fix independently
+    Agent 3: Only called if agents 1 and 2 disagree (tiebreaker)
+
+    Returns (approved: bool, reasoning: str, vote_details: dict)
+    """
+    st.session_state.voting_used = True
+
+    vote_prompt = f"""You are AGENT {{agent_num}} in a code review panel.
+Independently evaluate if this code fix is correct and complete.
+
+ISSUE BEING FIXED:
+- Severity: {issue.get('severity', 'unknown')}
+- Category: {issue.get('category', 'unknown')}
+- Description: {issue.get('description', 'unknown')}
+- Suggested Fix: {issue.get('fix', 'unknown')}
+
+ORIGINAL CODE:
+```python
+{original_code[:3000]}...
+```
+
+FIXED CODE:
+```python
+{fixed_code[:3000]}...
+```
+
+VOTE CRITERIA:
+1. Does the fix address the specific issue described?
+2. Does it avoid introducing new bugs?
+3. Is the implementation clean and minimal?
+
+Respond in JSON:
+{{"vote": "APPROVE" or "REJECT", "confidence": 1-10, "reasoning": "brief explanation"}}"""
+
+    votes = []
+
+    # Agent 1 votes
+    try:
+        response1 = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=500,
+            messages=[{"role": "user", "content": vote_prompt.format(agent_num=1)}]
+        )
+        result1 = response1.content[0].text
+        json_match1 = re.search(r'\{.*\}', result1, re.DOTALL)
+        if json_match1:
+            vote1 = json.loads(json_match1.group())
+            votes.append({"agent": 1, **vote1})
+    except Exception as e:
+        votes.append({"agent": 1, "vote": "ABSTAIN", "reasoning": str(e)})
+
+    # Agent 2 votes
+    try:
+        response2 = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=500,
+            messages=[{"role": "user", "content": vote_prompt.format(agent_num=2)}]
+        )
+        result2 = response2.content[0].text
+        json_match2 = re.search(r'\{.*\}', result2, re.DOTALL)
+        if json_match2:
+            vote2 = json.loads(json_match2.group())
+            votes.append({"agent": 2, **vote2})
+    except Exception as e:
+        votes.append({"agent": 2, "vote": "ABSTAIN", "reasoning": str(e)})
+
+    # Check if we need tiebreaker
+    approves = sum(1 for v in votes if v.get("vote") == "APPROVE")
+    rejects = sum(1 for v in votes if v.get("vote") == "REJECT")
+
+    # If tied (1-1), call Agent 3 as tiebreaker
+    if approves == 1 and rejects == 1:
+        try:
+            tiebreaker_prompt = vote_prompt.format(agent_num=3) + """
+
+IMPORTANT: You are the TIEBREAKER. Agents 1 and 2 disagreed.
+Agent 1 voted: """ + votes[0].get("vote", "UNKNOWN") + " - " + votes[0].get("reasoning", "")[:100] + """
+Agent 2 voted: """ + votes[1].get("vote", "UNKNOWN") + " - " + votes[1].get("reasoning", "")[:100] + """
+
+Cast the deciding vote."""
+
+            response3 = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                messages=[{"role": "user", "content": tiebreaker_prompt}]
+            )
+            result3 = response3.content[0].text
+            json_match3 = re.search(r'\{.*\}', result3, re.DOTALL)
+            if json_match3:
+                vote3 = json.loads(json_match3.group())
+                votes.append({"agent": 3, "tiebreaker": True, **vote3})
+                if vote3.get("vote") == "APPROVE":
+                    approves += 1
+                elif vote3.get("vote") == "REJECT":
+                    rejects += 1
+        except Exception as e:
+            votes.append({"agent": 3, "vote": "ABSTAIN", "reasoning": str(e)})
+
+    # Determine final result
+    approved = approves > rejects
+
+    # Build reasoning summary
+    reasoning_parts = []
+    for v in votes:
+        agent = v.get("agent", "?")
+        vote = v.get("vote", "ABSTAIN")
+        reason = v.get("reasoning", "")[:50]
+        tiebreaker = " (TIEBREAKER)" if v.get("tiebreaker") else ""
+        reasoning_parts.append(f"Agent {agent}{tiebreaker}: {vote} - {reason}")
+
+    final_reasoning = f"VOTE: {approves} APPROVE, {rejects} REJECT. " + " | ".join(reasoning_parts)
+
+    vote_details = {
+        "votes": votes,
+        "approves": approves,
+        "rejects": rejects,
+        "tiebreaker_needed": len(votes) > 2,
+        "final_decision": "APPROVED" if approved else "REJECTED"
+    }
+
+    return approved, final_reasoning, vote_details
+
+
 def format_analysis_text(analysis: dict, loop_num: int) -> str:
     """Format analysis results as copyable text."""
     lines = []
@@ -1071,6 +1263,37 @@ def test_mode():
     with st.expander("View code"):
         st.code(current_code, language="python")
 
+    # ==========================================================================
+    # APP MODE SELECTION - Critical for proper judgment
+    # ==========================================================================
+    st.subheader("📋 App Type")
+    st.caption("This affects how the analyzer judges your code - set this correctly!")
+
+    app_mode_col1, app_mode_col2 = st.columns([1, 2])
+    with app_mode_col1:
+        app_mode = st.radio(
+            "What type of app is this?",
+            options=list(APP_MODES.keys()),
+            format_func=lambda x: APP_MODES[x]["name"],
+            index=list(APP_MODES.keys()).index(st.session_state.app_mode),
+            key="app_mode_selector"
+        )
+        st.session_state.app_mode = app_mode
+
+    with app_mode_col2:
+        mode_info = APP_MODES[app_mode]
+        st.info(f"**{mode_info['name']}**\n\n{mode_info['description']}")
+
+        # Quick explanation of what this changes
+        if app_mode == "simple_mvp":
+            st.success("✅ JSON save/load is OK • Session state for temp data is OK • No database required")
+        elif app_mode == "full_app":
+            st.warning("⚠️ Database required • Persistent data must be in DB • Full security expected")
+        else:
+            st.info("🔬 Only critical bugs flagged • Style issues ignored • Experimental mode")
+
+    st.divider()
+
     # Test configuration
     st.subheader("Test Configuration")
 
@@ -1099,13 +1322,24 @@ def test_mode():
     with col_f:
         fix_mode = st.selectbox(
             "Fix Mode",
-            ["Batch (3 at once)", "One at a time", "Smart Delegation"],
-            help="Batch: Opus fixes 3 issues per round. One-at-a-time: Original slow mode. Smart: Haiku for simple, Opus for complex."
+            ["Batch (5 at once)", "Smart Delegation", "One at a time"],
+            help="Batch: Opus fixes 5 issues per round (fastest). Smart: Batches Opus issues, Haiku for simple. One-at-a-time: Original slow mode."
         )
     with col_g:
         use_haiku = st.checkbox("Use Haiku for simple fixes", value=True, help="LOW severity & best_practice fixes use Haiku (10x cheaper)")
     with col_h:
         skip_duplicates = st.checkbox("Skip duplicate issues", value=True, help="Don't try to fix issues that look the same as previous attempts")
+
+    # Row 4: Advanced Verification Options
+    col_vote, col_stats = st.columns(2)
+    with col_vote:
+        use_voting = st.checkbox(
+            "🗳️ Multi-Agent Voting",
+            value=False,
+            help="Use 3 Opus agents to vote on each fix (higher quality, 2-3x cost). Agent 3 only called if tie."
+        )
+    with col_stats:
+        show_stats = st.checkbox("📊 Show Mechanism Stats", value=True, help="Track which features are being used")
 
     # Clear results button (only show if we have results)
     col_start, col_clear = st.columns([3, 1])
@@ -1146,7 +1380,11 @@ def test_mode():
             st.subheader(f"📊 Analysis Loop {loop_count}/{max_loops}")
 
             with st.spinner(f"Claude analyzing code (attempt {loop_count})..."):
-                analysis = analyze_code_with_claude(client, code_to_test, test_steps, previous_issues if loop_count > 1 else None)
+                analysis = analyze_code_with_claude(
+                    client, code_to_test, test_steps,
+                    previous_issues if loop_count > 1 else None,
+                    app_mode=st.session_state.app_mode
+                )
 
             # Store in session_state so results persist across reruns
             st.session_state.analysis_results.append({"loop": loop_count, "analysis": analysis})
@@ -1249,24 +1487,35 @@ def test_mode():
                 original_code_before_fix = code_to_test
 
                 # ================================================================
-                # FIX MODE: BATCH (3 at once) - Let Opus handle multiple issues
+                # FIX MODE: BATCH (5 at once) - Let Opus handle multiple issues
                 # ================================================================
-                if fix_mode == "Batch (3 at once)":
-                    st.info(f"🔧 **BATCH MODE**: Fixing up to 3 issues at once with Opus 4.5...")
+                if fix_mode == "Batch (5 at once)":
+                    st.info(f"🔧 **BATCH MODE**: Fixing up to 5 issues at once with Opus 4.5...")
 
                     with st.spinner("Opus 4.5 fixing multiple issues in one pass..."):
                         fixed_code, was_changed, issues_attempted = batch_fix_issues(
-                            client, code_to_test, issues_to_process, max_issues=3
+                            client, code_to_test, issues_to_process, max_issues=5
                         )
+                        st.session_state.opus_fixes_count += len(issues_attempted) if was_changed else 0
+                        st.session_state.batch_fixes_count += 1 if was_changed and len(issues_attempted) > 1 else 0
 
                     if was_changed:
-                        # Verification with Opus (decision-making needs the best model)
-                        with st.spinner("🔍 Opus verifying batch fix..."):
-                            fix_verified, verification_reason = verify_fix_worked(
-                                client, original_code_before_fix, fixed_code, issues_attempted[0]
-                            )
+                        # Verification: Use voting system if enabled, otherwise single Opus verification
+                        if use_voting:
+                            with st.spinner("🗳️ Multi-agent voting on batch fix..."):
+                                fix_verified, verification_reason, vote_details = multi_agent_vote(
+                                    client, original_code_before_fix, fixed_code, issues_attempted[0]
+                                )
+                                st.info(f"📊 Vote result: {vote_details['approves']} approve, {vote_details['rejects']} reject" +
+                                       (" (tiebreaker used)" if vote_details['tiebreaker_needed'] else ""))
+                        else:
+                            with st.spinner("🔍 Opus verifying batch fix..."):
+                                fix_verified, verification_reason = verify_fix_worked(
+                                    client, original_code_before_fix, fixed_code, issues_attempted[0]
+                                )
 
                         if fix_verified:
+                            st.session_state.verification_passes += 1
                             code_to_test = fixed_code
                             for issue in issues_attempted:
                                 fixed_issue_ids.add(get_issue_fingerprint(issue))
@@ -1285,46 +1534,106 @@ def test_mode():
                             st.info("Falling back to single issue fix...")
 
                 # ================================================================
-                # FIX MODE: SMART DELEGATION - Haiku for simple, Opus for complex
+                # FIX MODE: SMART DELEGATION - Actually smart batching!
+                # Groups simple issues for Haiku, complex issues for Opus batch
                 # ================================================================
                 elif fix_mode == "Smart Delegation":
-                    issue_to_fix = issues_to_process[0]
-                    use_haiku_for_this = use_haiku and should_use_haiku(issue_to_fix)
+                    # Separate issues into Haiku-appropriate vs Opus-required
+                    haiku_issues = []
+                    opus_issues = []
 
-                    if use_haiku_for_this:
+                    for issue in issues_to_process[:5]:  # Consider up to 5 issues
+                        if use_haiku and should_use_haiku(issue):
+                            haiku_issues.append(issue)
+                        else:
+                            opus_issues.append(issue)
+
+                    st.info(f"📊 **SMART DELEGATION**: {len(opus_issues)} complex (Opus) + {len(haiku_issues)} simple (Haiku eligible)")
+
+                    # PRIORITY 1: Handle complex issues with Opus batch (up to 5 at once!)
+                    if opus_issues:
+                        batch_size = min(5, len(opus_issues))  # Opus can handle 5 at once
+                        st.info(f"🧠 **OPUS** batch fixing {batch_size} complex issue(s)...")
+
+                        with st.spinner(f"Opus 4.5 fixing {batch_size} issues in one pass..."):
+                            fixed_code, was_changed, issues_attempted = batch_fix_issues(
+                                client, code_to_test, opus_issues, max_issues=5
+                            )
+                            st.session_state.opus_fixes_count += len(issues_attempted) if was_changed else 0
+                            st.session_state.batch_fixes_count += 1 if was_changed and len(issues_attempted) > 1 else 0
+
+                        if was_changed:
+                            # Verification: Use voting if enabled
+                            if use_voting:
+                                with st.spinner("🗳️ Multi-agent voting on Smart batch fix..."):
+                                    fix_verified, verification_reason, vote_details = multi_agent_vote(
+                                        client, original_code_before_fix, fixed_code, issues_attempted[0]
+                                    )
+                                    st.info(f"📊 Vote: {vote_details['approves']} approve, {vote_details['rejects']} reject")
+                            else:
+                                with st.spinner("🔍 Opus verifying batch fix..."):
+                                    fix_verified, verification_reason = verify_fix_worked(
+                                        client, original_code_before_fix, fixed_code, issues_attempted[0]
+                                    )
+
+                            if fix_verified:
+                                st.session_state.verification_passes += 1
+                            else:
+                                st.session_state.verification_fails += 1
+
+                            if fix_verified:
+                                code_to_test = fixed_code
+                                for issue in issues_attempted:
+                                    fixed_issue_ids.add(get_issue_fingerprint(issue))
+                                previous_issues = issues_attempted
+
+                                app_file.write_text(fixed_code, encoding="utf-8")
+                                add_log(f"[Opus Batch] Fixed {len(issues_attempted)} issue(s) - loop {loop_count}")
+
+                                st.success(f"✅ Opus batch verified! Fixed {len(issues_attempted)} complex issues")
+                                with st.expander("View fixed code"):
+                                    st.code(fixed_code, language="python")
+                                continue
+                            else:
+                                st.warning(f"⚠️ Opus batch rejected: {verification_reason[:80]}")
+
+                    # PRIORITY 2: Handle simple issues with Haiku (one at a time for safety)
+                    elif haiku_issues:
+                        issue_to_fix = haiku_issues[0]
                         st.info(f"🐦 **HAIKU** fixing simple issue: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
+
                         with st.spinner("Haiku fixing (fast & cheap)..."):
                             fixed_code, was_changed = fix_with_haiku(client, code_to_test, issue_to_fix)
-                    else:
-                        st.info(f"🧠 **OPUS** fixing complex issue: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
-                        with st.spinner("Opus 4.5 fixing..."):
-                            fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+                            st.session_state.haiku_fixes_count += 1 if was_changed else 0
 
-                    if was_changed:
-                        with st.spinner("🔍 Verifying fix..."):
-                            fix_verified, verification_reason = verify_fix_worked(
-                                client, original_code_before_fix, fixed_code, issue_to_fix
-                            )
+                        if was_changed:
+                            with st.spinner("🔍 Verifying fix..."):
+                                fix_verified, verification_reason = verify_fix_worked(
+                                    client, original_code_before_fix, fixed_code, issue_to_fix
+                                )
+                                if fix_verified:
+                                    st.session_state.verification_passes += 1
+                                else:
+                                    st.session_state.verification_fails += 1
 
-                        if fix_verified:
-                            code_to_test = fixed_code
-                            fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
-                            previous_issues = [issue_to_fix]
+                            if fix_verified:
+                                code_to_test = fixed_code
+                                fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
+                                previous_issues = [issue_to_fix]
 
-                            app_file.write_text(fixed_code, encoding="utf-8")
-                            model_used = "Haiku" if use_haiku_for_this else "Opus"
-                            add_log(f"[{model_used}] Fixed: {issue_to_fix.get('description', '')[:30]}...")
+                                app_file.write_text(fixed_code, encoding="utf-8")
+                                add_log(f"[Haiku] Fixed: {issue_to_fix.get('description', '')[:30]}...")
 
-                            st.success(f"✅ Fix verified ({model_used}): {verification_reason[:60]}")
-                            continue
+                                st.success(f"✅ Haiku fix verified: {verification_reason[:60]}")
+                                continue
+                            else:
+                                st.warning(f"⚠️ Haiku fix rejected: {verification_reason[:80]}")
                         else:
-                            st.warning(f"⚠️ Fix rejected: {verification_reason[:80]}")
-                    else:
-                        st.warning("Could not apply fix")
+                            st.warning("Haiku could not apply fix")
 
-                    # Try next issue if first failed
+                    # If all else fails, continue to next loop
                     if len(issues_to_process) > 1:
-                        st.info("Trying next issue...")
+                        st.info("Moving to next analysis loop...")
                         continue
                     break
 
@@ -1388,6 +1697,38 @@ def test_mode():
     # ==========================================================================
     if st.session_state.analysis_complete and st.session_state.final_fixed_code:
         st.divider()
+
+        # Show mechanism stats if enabled
+        if show_stats:
+            st.subheader("📊 Mechanism Usage Stats")
+            stat_cols = st.columns(4)
+            with stat_cols[0]:
+                st.metric("🧠 Opus Fixes", st.session_state.opus_fixes_count)
+            with stat_cols[1]:
+                st.metric("🐦 Haiku Fixes", st.session_state.haiku_fixes_count)
+            with stat_cols[2]:
+                st.metric("📦 Batch Fixes", st.session_state.batch_fixes_count)
+            with stat_cols[3]:
+                total_verifications = st.session_state.verification_passes + st.session_state.verification_fails
+                pass_rate = (st.session_state.verification_passes / total_verifications * 100) if total_verifications > 0 else 0
+                st.metric("✅ Verification Pass Rate", f"{pass_rate:.0f}%")
+
+            # Show feature flags
+            features_used = []
+            if st.session_state.coding_bible_used:
+                features_used.append("📖 Coding Bible")
+            if st.session_state.voting_used:
+                features_used.append("🗳️ Multi-Agent Voting")
+            if st.session_state.batch_fixes_count > 0:
+                features_used.append("📦 Batch Fixing")
+            if st.session_state.haiku_fixes_count > 0:
+                features_used.append("🐦 Haiku Delegation")
+
+            if features_used:
+                st.caption(f"**Features used:** {' • '.join(features_used)}")
+
+            st.divider()
+
         st.subheader("📥 Export Results")
 
         # Get values from session_state
