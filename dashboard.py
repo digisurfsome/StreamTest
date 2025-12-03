@@ -861,6 +861,7 @@ Be specific about what code to change. Include actual code snippets."""
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=4000,
+            temperature=0,  # Use temperature=0 for consistent analysis
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -1507,6 +1508,7 @@ def test_mode():
         previous_issues = []
         best_code = current_code  # Track best version for regression protection
         best_score = 0
+        just_reverted = False  # Prevent infinite revert loops
 
         while loop_count < max_loops:
             # CHECK FOR EMERGENCY STOP
@@ -1552,26 +1554,42 @@ def test_mode():
 
             # REGRESSION DETECTION & PROTECTION
             if len(score_history) >= 2 and score < score_history[-2]:
-                # Score went DOWN! This is a regression
                 regression_amount = score_history[-2] - score
-                st.error(f"❌ **REGRESSION DETECTED**: Score dropped {regression_amount} points ({score_history[-2]}→{score})")
 
-                # Revert to best code if we have something better
-                if best_score > score:
-                    st.warning(f"🔄 Reverting to best known version (score: {best_score})...")
-                    code_to_test = best_code
-                    app_file.write_text(best_code, encoding="utf-8")
-                    add_log(f"REVERTED: Score regression {score_history[-2]}→{score}, reverted to best ({best_score})")
-                    st.info(f"✅ Reverted! Will re-analyze from best version...")
-                    # Remove the bad score from history
-                    score_history.pop()
-                    continue  # Re-analyze the reverted code
+                # If we JUST reverted and score is still lower, it's analyzer inconsistency
+                if just_reverted:
+                    st.warning(f"⚠️ Score variation detected after revert ({score_history[-2]}→{score})")
+                    st.info(f"📊 Analyzer inconsistency - score varies ±{regression_amount} points. Accepting current state.")
+                    add_log(f"Analyzer inconsistency: {score_history[-2]}→{score} after revert")
+                    # Don't revert again - accept this is analyzer noise
+                    # Keep best_code but continue with current score
+                    just_reverted = False
+                elif regression_amount >= 5:
+                    # Only revert for SIGNIFICANT regressions (5+ points)
+                    st.error(f"❌ **REGRESSION DETECTED**: Score dropped {regression_amount} points ({score_history[-2]}→{score})")
+
+                    if best_score > score:
+                        st.warning(f"🔄 Reverting to best known version (score: {best_score})...")
+                        code_to_test = best_code
+                        app_file.write_text(best_code, encoding="utf-8")
+                        add_log(f"REVERTED: Score regression {score_history[-2]}→{score}, reverted to best ({best_score})")
+                        st.info(f"✅ Reverted! Will re-analyze from best version...")
+                        score_history.pop()
+                        just_reverted = True  # Mark that we just reverted
+                        continue
+                else:
+                    # Small regression (1-4 points) - likely analyzer noise
+                    st.warning(f"⚠️ Small score variation: {score_history[-2]}→{score} ({regression_amount} pts)")
+                    st.caption("Small variations are normal - continuing...")
+            else:
+                just_reverted = False  # Reset flag if score didn't drop
 
             # Update best code if this is the highest score
             if score > best_score:
                 best_score = score
                 best_code = code_to_test
                 st.caption(f"📈 New best score: {best_score}/100")
+                just_reverted = False  # Reset on improvement
 
             # PLATEAU DETECTION: Stop if score hasn't improved for 3 consecutive loops
             if len(score_history) >= 3:
