@@ -1489,6 +1489,7 @@ def test_mode():
 
         # Local tracking during this run
         fixed_issue_ids = set()
+        score_history = []  # Track scores to detect plateaus
 
         code_to_test = current_code
         loop_count = 0
@@ -1510,6 +1511,8 @@ def test_mode():
 
             # Display score
             score = analysis.get("overall_score", 0)
+            score_history.append(score)
+
             if score >= 90:
                 st.success(f"✅ Score: {score}/100 - Excellent!")
             elif score >= 70:
@@ -1518,6 +1521,23 @@ def test_mode():
                 st.error(f"❌ Score: {score}/100 - Significant issues")
 
             st.progress(score / 100)
+
+            # PLATEAU DETECTION: Stop if score hasn't improved for 3 consecutive loops
+            if len(score_history) >= 3:
+                recent_scores = score_history[-3:]
+                if recent_scores[0] == recent_scores[1] == recent_scores[2]:
+                    # Check if score is "good enough" (>= 80)
+                    if score >= 80:
+                        st.success(f"🎯 Score plateaued at {score}/100 for 3 loops - this is good enough! Stopping.")
+                        st.session_state.status = "passed"
+                        add_log(f"Test PASSED (plateau at {score}): {selected_project}")
+                        break
+                    elif score >= 70:
+                        st.warning(f"⚠️ Score plateaued at {score}/100 for 3 loops. Consider reviewing manually.")
+                        # Continue trying for a bit more
+                        if len(score_history) >= 5 and all(s == score for s in score_history[-5:]):
+                            st.info(f"📊 Score stuck at {score} for 5 loops. Stopping to avoid infinite loop.")
+                            break
 
             # Display issues with Expand All / Copy All buttons
             issues = analysis.get("issues", [])
@@ -1599,6 +1619,24 @@ def test_mode():
                     if len(issues_to_process) < len(sorted_issues):
                         st.info(f"⏭️ Skipped {len(sorted_issues) - len(issues_to_process)} duplicate issue(s)")
 
+                # "GOOD ENOUGH" threshold: Skip LOW severity issues if score >= 85
+                if score >= 85:
+                    high_priority_issues = [
+                        issue for issue in issues_to_process
+                        if issue.get("severity", "low") in ["critical", "high", "medium"]
+                    ]
+                    low_count = len(issues_to_process) - len(high_priority_issues)
+                    if low_count > 0:
+                        st.info(f"🎯 Score >= 85: Skipping {low_count} LOW severity issue(s) - focusing on important fixes")
+                        issues_to_process = high_priority_issues
+
+                    # If only LOW severity issues remain, we're done!
+                    if not issues_to_process:
+                        st.success(f"🎉 Score {score}/100 with only LOW severity issues remaining - that's good enough!")
+                        st.session_state.status = "passed"
+                        add_log(f"Test PASSED (good enough at {score}): {selected_project}")
+                        break
+
                 if not issues_to_process:
                     st.warning("All remaining issues are duplicates. Moving to next loop...")
                     continue
@@ -1648,9 +1686,38 @@ def test_mode():
                                 st.code(fixed_code, language="python")
                             continue
                         else:
+                            st.session_state.verification_fails += 1
                             st.warning(f"⚠️ Batch fix rejected: {verification_reason[:80]}")
-                            # Fall back to one-at-a-time for this loop
                             st.info("Falling back to single issue fix...")
+
+                            # ACTUAL FALLBACK: Try fixing just the first issue without voting
+                            issue_to_fix = issues_to_process[0]
+                            st.info(f"🔧 Single fix: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
+
+                            with st.spinner("Opus fixing single issue..."):
+                                single_fixed_code, single_was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+
+                            if single_was_changed:
+                                # Simple verification without voting for fallback
+                                with st.spinner("🔍 Verifying single fix..."):
+                                    single_verified, single_reason = verify_fix_worked(
+                                        client, original_code_before_fix, single_fixed_code, issue_to_fix
+                                    )
+
+                                if single_verified:
+                                    st.session_state.verification_passes += 1
+                                    code_to_test = single_fixed_code
+                                    fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
+                                    previous_issues = [issue_to_fix]
+                                    app_file.write_text(single_fixed_code, encoding="utf-8")
+                                    add_log(f"[Fallback] Fixed: {issue_to_fix.get('description', '')[:30]}...")
+                                    st.success(f"✅ Fallback single fix applied!")
+                                    continue
+                                else:
+                                    st.session_state.verification_fails += 1
+                                    st.warning(f"⚠️ Fallback also rejected: {single_reason[:60]}")
+                            else:
+                                st.warning("Fallback fix could not be applied")
 
                 # ================================================================
                 # FIX MODE: SMART DELEGATION - Actually smart batching!
@@ -1715,6 +1782,35 @@ def test_mode():
                                 continue
                             else:
                                 st.warning(f"⚠️ Opus batch rejected: {verification_reason[:80]}")
+                                st.info("Falling back to single issue fix...")
+
+                                # ACTUAL FALLBACK: Try fixing just the first complex issue
+                                issue_to_fix = opus_issues[0]
+                                st.info(f"🔧 Single fix: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
+
+                                with st.spinner("Opus fixing single issue..."):
+                                    single_fixed_code, single_was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+
+                                if single_was_changed:
+                                    with st.spinner("🔍 Verifying single fix..."):
+                                        single_verified, single_reason = verify_fix_worked(
+                                            client, original_code_before_fix, single_fixed_code, issue_to_fix
+                                        )
+
+                                    if single_verified:
+                                        st.session_state.verification_passes += 1
+                                        code_to_test = single_fixed_code
+                                        fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
+                                        previous_issues = [issue_to_fix]
+                                        app_file.write_text(single_fixed_code, encoding="utf-8")
+                                        add_log(f"[Smart Fallback] Fixed: {issue_to_fix.get('description', '')[:30]}...")
+                                        st.success(f"✅ Fallback single fix applied!")
+                                        continue
+                                    else:
+                                        st.session_state.verification_fails += 1
+                                        st.warning(f"⚠️ Fallback also rejected: {single_reason[:60]}")
+                                else:
+                                    st.warning("Fallback fix could not be applied")
 
                     # PRIORITY 2: Handle simple issues with Haiku (one at a time for safety)
                     elif haiku_issues:
