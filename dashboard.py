@@ -1174,10 +1174,16 @@ AGENT 1'S FIXED CODE:
 {fixed_code[:3000]}
 ```
 
-REVIEW CRITERIA:
-1. Does the fix address the specific issue?
-2. Does it avoid introducing new bugs?
-3. Is it clean and minimal?
+REVIEW CRITERIA (BE LENIENT - this is MVP-level code):
+1. Does the fix address the specific issue? (MOST IMPORTANT)
+2. Does it avoid introducing OBVIOUS new bugs? (don't nitpick)
+3. Is it functional? (clean/minimal is nice but not required)
+
+IMPORTANT: You should APPROVE unless there's a CLEAR, OBVIOUS problem.
+- Minor style issues = APPROVE (not your job to bikeshed)
+- Could be slightly better = APPROVE (perfect is enemy of good)
+- Doesn't break anything = APPROVE
+- Only REJECT if the fix is WRONG or introduces REAL bugs
 
 Respond in JSON:
 {{
@@ -1233,9 +1239,12 @@ AGENT 2'S OBJECTION:
 AGENT 2'S PROPOSED CHANGE:
 "{agent2_proposed}"
 
-YOUR TASK: Cast the deciding vote.
+YOUR TASK: Cast the deciding vote. (BIAS TOWARDS APPROVE)
 - Vote APPROVE if Agent 1's fix is good enough (accept it as-is)
-- Vote REJECT if Agent 2 is right (the fix needs changes)
+- Vote REJECT ONLY if Agent 2 found a REAL, SERIOUS problem
+
+IMPORTANT: When in doubt, APPROVE. This is MVP code - progress > perfection.
+Agent 2 reviewers are often too picky. Only reject for OBVIOUS problems.
 
 Respond in JSON:
 {{"vote": "APPROVE" or "REJECT", "reasoning": "brief explanation of your decision"}}"""
@@ -1485,6 +1494,8 @@ def test_mode():
         st.session_state.tested_project = selected_project
         st.session_state.current_project = selected_project
         st.session_state.status = "testing"
+        st.session_state.stop_requested = False  # For emergency stop
+        st.session_state.fixes_applied = []  # Track all fix attempts for report
         add_log(f"Starting test: {selected_project}")
 
         # Local tracking during this run
@@ -1494,10 +1505,27 @@ def test_mode():
         code_to_test = current_code
         loop_count = 0
         previous_issues = []
+        best_code = current_code  # Track best version for regression protection
+        best_score = 0
 
         while loop_count < max_loops:
+            # CHECK FOR EMERGENCY STOP
+            if st.session_state.get('stop_requested', False):
+                st.warning("🛑 **STOPPED BY USER** - Generating report...")
+                st.session_state.status = "stopped"
+                add_log(f"Test STOPPED by user at loop {loop_count}: {selected_project}")
+                break
+
             loop_count += 1
-            st.subheader(f"📊 Analysis Loop {loop_count}/{max_loops}")
+
+            # EMERGENCY STOP BUTTON - visible during each loop
+            stop_col1, stop_col2 = st.columns([3, 1])
+            with stop_col1:
+                st.subheader(f"📊 Analysis Loop {loop_count}/{max_loops}")
+            with stop_col2:
+                if st.button("🛑 STOP & REPORT", key=f"stop_btn_{loop_count}", type="secondary"):
+                    st.session_state.stop_requested = True
+                    st.rerun()
 
             with st.spinner(f"Claude analyzing code (attempt {loop_count})..."):
                 analysis = analyze_code_with_claude(
@@ -1521,6 +1549,29 @@ def test_mode():
                 st.error(f"❌ Score: {score}/100 - Significant issues")
 
             st.progress(score / 100)
+
+            # REGRESSION DETECTION & PROTECTION
+            if len(score_history) >= 2 and score < score_history[-2]:
+                # Score went DOWN! This is a regression
+                regression_amount = score_history[-2] - score
+                st.error(f"❌ **REGRESSION DETECTED**: Score dropped {regression_amount} points ({score_history[-2]}→{score})")
+
+                # Revert to best code if we have something better
+                if best_score > score:
+                    st.warning(f"🔄 Reverting to best known version (score: {best_score})...")
+                    code_to_test = best_code
+                    app_file.write_text(best_code, encoding="utf-8")
+                    add_log(f"REVERTED: Score regression {score_history[-2]}→{score}, reverted to best ({best_score})")
+                    st.info(f"✅ Reverted! Will re-analyze from best version...")
+                    # Remove the bad score from history
+                    score_history.pop()
+                    continue  # Re-analyze the reverted code
+
+            # Update best code if this is the highest score
+            if score > best_score:
+                best_score = score
+                best_code = code_to_test
+                st.caption(f"📈 New best score: {best_score}/100")
 
             # PLATEAU DETECTION: Stop if score hasn't improved for 3 consecutive loops
             if len(score_history) >= 3:
@@ -1905,6 +1956,7 @@ def test_mode():
         st.session_state.final_fixed_code = code_to_test
         st.session_state.final_project_name = selected_project
         st.session_state.test_loop_count = loop_count
+        st.session_state.score_history = score_history  # Save score history for report
         st.session_state.analysis_complete = True
 
     # ==========================================================================
@@ -1977,11 +2029,34 @@ def test_mode():
         # Reports section
         st.markdown("### 📊 Analysis Reports")
 
+        # Show score history graph if available
+        score_history_data = st.session_state.get('score_history', [])
+        if len(score_history_data) > 1:
+            st.markdown("**Score Progression:**")
+            score_text = " → ".join([str(s) for s in score_history_data])
+            # Detect regressions
+            regressions = []
+            for i in range(1, len(score_history_data)):
+                if score_history_data[i] < score_history_data[i-1]:
+                    regressions.append(f"Loop {i+1}: {score_history_data[i-1]}→{score_history_data[i]}")
+            if regressions:
+                st.error(f"⚠️ Score went DOWN at: {', '.join(regressions)}")
+            st.code(score_text)
+
         full_export = {
             "project": project_to_export,
             "total_loops": loop_count_export,
             "final_status": st.session_state.status,
+            "score_history": score_history_data,
+            "score_regressions": [i for i in range(1, len(score_history_data)) if score_history_data[i] < score_history_data[i-1]] if len(score_history_data) > 1 else [],
             "analyses": all_analyses_export,
+            "mechanism_stats": {
+                "opus_fixes": st.session_state.get('opus_fixes_count', 0),
+                "haiku_fixes": st.session_state.get('haiku_fixes_count', 0),
+                "batch_fixes": st.session_state.get('batch_fixes_count', 0),
+                "verification_passes": st.session_state.get('verification_passes', 0),
+                "verification_fails": st.session_state.get('verification_fails', 0),
+            },
             "final_code": code_to_export,
             "final_code_length": len(code_to_export),
         }
@@ -2011,6 +2086,47 @@ def test_mode():
                 mime="text/plain; charset=utf-8",
                 key="download_txt_report"
             )
+
+        # DEBUG REPORT - Detailed view for troubleshooting
+        st.divider()
+        st.markdown("### 🔍 Debug Report")
+        with st.expander("📋 View Detailed Debug Info (for troubleshooting)", expanded=False):
+            st.markdown("#### Score History")
+            if score_history_data:
+                for i, score in enumerate(score_history_data):
+                    change = ""
+                    if i > 0:
+                        diff = score - score_history_data[i-1]
+                        if diff > 0:
+                            change = f" (+{diff} ✅)"
+                        elif diff < 0:
+                            change = f" ({diff} ❌ REGRESSION)"
+                        else:
+                            change = " (no change)"
+                    st.write(f"Loop {i+1}: **{score}/100**{change}")
+
+            st.markdown("#### Mechanism Stats")
+            st.json({
+                "opus_fixes": st.session_state.get('opus_fixes_count', 0),
+                "haiku_fixes": st.session_state.get('haiku_fixes_count', 0),
+                "batch_fixes": st.session_state.get('batch_fixes_count', 0),
+                "verification_passes": st.session_state.get('verification_passes', 0),
+                "verification_fails": st.session_state.get('verification_fails', 0),
+                "coding_bible_used": st.session_state.get('coding_bible_used', False),
+                "voting_used": st.session_state.get('voting_used', False),
+            })
+
+            st.markdown("#### All Analyses (Raw)")
+            for item in all_analyses_export:
+                st.markdown(f"**Loop {item['loop']}**")
+                analysis = item['analysis']
+                st.write(f"Score: {analysis.get('overall_score', 'N/A')}")
+                st.write(f"Issues found: {len(analysis.get('issues', []))}")
+                issues = analysis.get('issues', [])
+                if issues:
+                    for idx, issue in enumerate(issues):
+                        st.caption(f"  [{issue.get('severity', '?').upper()}] {issue.get('description', 'N/A')[:80]}")
+                st.markdown("---")
 
 
 # =============================================================================
