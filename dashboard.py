@@ -81,6 +81,11 @@ def init_session_state():
         # Store fixed code for download
         "final_fixed_code": None,
         "final_project_name": None,
+        # TEST MODE: Persist analysis results across reruns (fixes download button bug)
+        "analysis_results": [],  # List of {loop, analysis} dicts
+        "analysis_complete": False,  # Flag to show results section
+        "tested_project": None,  # Project name that was tested
+        "test_loop_count": 0,  # Number of loops completed
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -720,6 +725,61 @@ Return ONLY the complete Python code, no explanations."""
         return code, False
 
 
+def verify_fix_worked(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str]:
+    """
+    VERIFIER: Independent Opus instance checks if the fix actually resolved the issue.
+    Returns (fix_worked: bool, reasoning: str)
+    """
+    prompt = f"""You are an independent CODE VERIFIER. Your job is to determine if a fix actually resolved the issue it was meant to fix.
+
+ORIGINAL ISSUE THAT NEEDED FIXING:
+- Severity: {issue.get('severity', 'unknown')}
+- Category: {issue.get('category', 'unknown')}
+- Description: {issue.get('description', 'unknown')}
+- Suggested Fix: {issue.get('fix', 'unknown')}
+- Code that needed changing: {issue.get('code_snippet', 'N/A')}
+
+ORIGINAL CODE (BEFORE FIX):
+```python
+{original_code[:3000]}  # Truncated for context
+```
+
+FIXED CODE (AFTER FIX):
+```python
+{fixed_code[:3000]}  # Truncated for context
+```
+
+IMPORTANT: You are verifying whether THIS SPECIFIC ISSUE was fixed, not looking for other issues.
+
+Analyze the changes and respond in this exact JSON format:
+{{
+    "fix_worked": true/false,
+    "reasoning": "Brief explanation of why the fix did or did not address the specific issue",
+    "changes_made": "What actually changed in the code",
+    "issue_still_present": true/false
+}}
+
+Be objective. Only say fix_worked=true if the specific issue described was actually addressed."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+        json_match = re.search(r'\{.*\}', result, re.DOTALL)
+        if json_match:
+            verification = json.loads(json_match.group())
+            return verification.get("fix_worked", False), verification.get("reasoning", "No reasoning provided")
+    except Exception as e:
+        st.warning(f"Verification check failed: {e}")
+
+    # Default to assuming fix worked if verification fails
+    return True, "Verification check could not be completed"
+
+
 def format_analysis_text(analysis: dict, loop_num: int) -> str:
     """Format analysis results as copyable text."""
     lines = []
@@ -837,17 +897,34 @@ def test_mode():
     with col_e:
         run_all_loops = st.checkbox("Run all loops", value=False, help="Ignore target score, run all loops regardless")
 
-    if st.button("🚀 Start Analysis", type="primary"):
+    # Clear results button (only show if we have results)
+    col_start, col_clear = st.columns([3, 1])
+    with col_start:
+        start_analysis = st.button("🚀 Start Analysis", type="primary")
+    with col_clear:
+        if st.session_state.analysis_complete:
+            if st.button("🗑️ Clear Results"):
+                st.session_state.analysis_results = []
+                st.session_state.analysis_complete = False
+                st.session_state.final_fixed_code = None
+                st.session_state.tested_project = None
+                st.session_state.test_loop_count = 0
+                st.rerun()
+
+    if start_analysis:
         client = get_client()
         if not client:
             return
 
+        # Clear previous results and start fresh
+        st.session_state.analysis_results = []
+        st.session_state.analysis_complete = False
+        st.session_state.tested_project = selected_project
         st.session_state.current_project = selected_project
         st.session_state.status = "testing"
         add_log(f"Starting test: {selected_project}")
 
-        # Store all analysis results for export
-        all_analyses = []
+        # Local tracking during this run
         fixed_issue_ids = set()
 
         code_to_test = current_code
@@ -861,7 +938,8 @@ def test_mode():
             with st.spinner(f"Claude analyzing code (attempt {loop_count})..."):
                 analysis = analyze_code_with_claude(client, code_to_test, test_steps, previous_issues if loop_count > 1 else None)
 
-            all_analyses.append({"loop": loop_count, "analysis": analysis})
+            # Store in session_state so results persist across reruns
+            st.session_state.analysis_results.append({"loop": loop_count, "analysis": analysis})
 
             # Display score
             score = analysis.get("overall_score", 0)
@@ -949,35 +1027,80 @@ def test_mode():
                     issue_to_fix = sorted_issues[0]
                     st.info(f"🔧 Fixing most critical issue: [{issue_to_fix.get('severity', 'unknown').upper()}] {issue_to_fix.get('description', '')[:50]}...")
 
+                    # Store original code for verification
+                    original_code_before_fix = code_to_test
+
                     with st.spinner("Claude fixing this specific issue..."):
                         fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
 
                     if was_changed:
-                        code_to_test = fixed_code
-                        fixed_issue_ids.add(issue_to_fix.get("id", f"issue_0"))
-                        previous_issues = [issue_to_fix]  # Track what we tried to fix
+                        # VERIFICATION STEP: Independent check if fix actually worked
+                        with st.spinner("🔍 Verifier checking if fix actually resolved the issue..."):
+                            fix_verified, verification_reason = verify_fix_worked(
+                                client, original_code_before_fix, fixed_code, issue_to_fix
+                            )
 
-                        # Save fixed code
-                        app_file.write_text(fixed_code, encoding="utf-8")
-                        add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
+                        if fix_verified:
+                            st.success(f"✅ Verifier confirmed: {verification_reason[:100]}")
+                            code_to_test = fixed_code
+                            fixed_issue_ids.add(issue_to_fix.get("id", f"issue_0"))
+                            previous_issues = [issue_to_fix]
 
-                        with st.expander("View fixed code"):
-                            st.code(fixed_code, language="python")
+                            # Save fixed code
+                            app_file.write_text(fixed_code, encoding="utf-8")
+                            add_log(f"Applied verified fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
 
-                        st.success("✅ Fix applied, re-analyzing to verify...")
-                        continue
+                            with st.expander("View fixed code"):
+                                st.code(fixed_code, language="python")
+
+                            st.success("✅ Fix verified and applied, re-analyzing...")
+                            continue
+                        else:
+                            # Verification failed - fix didn't actually work
+                            st.warning(f"⚠️ Verifier rejected fix: {verification_reason[:100]}")
+                            add_log(f"Fix rejected by verifier: {verification_reason[:50]}...")
+
+                            # Try next issue instead
+                            if len(sorted_issues) > 1:
+                                st.info("Trying next issue instead...")
+                                issue_to_fix = sorted_issues[1]
+                                original_code_before_fix = code_to_test
+
+                                with st.spinner("Claude fixing alternative issue..."):
+                                    fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+
+                                if was_changed:
+                                    with st.spinner("🔍 Verifying alternative fix..."):
+                                        fix_verified, verification_reason = verify_fix_worked(
+                                            client, original_code_before_fix, fixed_code, issue_to_fix
+                                        )
+
+                                    if fix_verified:
+                                        code_to_test = fixed_code
+                                        app_file.write_text(fixed_code, encoding="utf-8")
+                                        add_log(f"Applied alternative fix (loop {loop_count})")
+                                        st.success(f"✅ Alternative fix verified: {verification_reason[:80]}")
+                                        continue
+
+                            st.warning("Could not find a verified fix. Moving to next analysis loop...")
+                            continue
                     else:
                         st.warning("⚠️ Could not apply fix for this issue. Trying next...")
                         # Try next issue
                         if len(sorted_issues) > 1:
                             issue_to_fix = sorted_issues[1]
+                            original_code_before_fix = code_to_test
                             with st.spinner("Trying next issue..."):
                                 fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
                             if was_changed:
-                                code_to_test = fixed_code
-                                app_file.write_text(fixed_code, encoding="utf-8")
-                                add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
-                                continue
+                                # Verify the alternative fix too
+                                with st.spinner("🔍 Verifying fix..."):
+                                    fix_verified, _ = verify_fix_worked(client, original_code_before_fix, fixed_code, issue_to_fix)
+                                if fix_verified:
+                                    code_to_test = fixed_code
+                                    app_file.write_text(fixed_code, encoding="utf-8")
+                                    add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
+                                    continue
                         break
                 else:
                     # Fix all issues at once (old behavior)
@@ -1027,33 +1150,49 @@ Return ONLY the complete fixed Python code."""
                     st.info("Auto-fix disabled. Enable to automatically fix issues.")
                 break
 
-        # Final status and export
+        # Final status and store results in session_state
         if st.session_state.status != "passed":
             st.session_state.status = "failed"
             add_log(f"Test completed with issues: {selected_project}")
 
-        # Full export with all analysis data
+        # Store final results in session_state for persistent display
+        st.session_state.final_fixed_code = code_to_test
+        st.session_state.final_project_name = selected_project
+        st.session_state.test_loop_count = loop_count
+        st.session_state.analysis_complete = True
+
+    # ==========================================================================
+    # RESULTS DISPLAY - Outside button block so it persists across reruns
+    # ==========================================================================
+    if st.session_state.analysis_complete and st.session_state.final_fixed_code:
         st.divider()
         st.subheader("📥 Export Results")
 
+        # Get values from session_state
+        code_to_export = st.session_state.final_fixed_code
+        project_to_export = st.session_state.final_project_name or st.session_state.tested_project
+        loop_count_export = st.session_state.test_loop_count
+        all_analyses_export = st.session_state.analysis_results
+
         # MOST IMPORTANT: Download Fixed Code button
         st.markdown("### 🔧 Fixed Code")
-        st.success(f"Final code ready for download ({len(code_to_test)} characters)")
+        st.success(f"Final code ready for download ({len(code_to_export)} characters)")
 
         col_code1, col_code2 = st.columns(2)
         with col_code1:
             st.download_button(
                 "⬇️ DOWNLOAD FIXED CODE (.py)",
-                code_to_test,
-                file_name=f"{selected_project}_fixed.py",
+                code_to_export,
+                file_name=f"{project_to_export}_fixed.py",
                 mime="text/x-python",
-                type="primary"
+                type="primary",
+                key="download_fixed_code"
             )
         with col_code2:
             # Show code in expander with line count
-            line_count = len(code_to_test.split('\n'))
+            line_count = len(code_to_export.split('\n'))
             with st.expander(f"📄 View Fixed Code ({line_count} lines)"):
-                st.code(code_to_test, language="python")
+                st.code(code_to_export, language="python")
 
         st.divider()
 
@@ -1061,12 +1200,12 @@ Return ONLY the complete fixed Python code."""
         st.markdown("### 📊 Analysis Reports")
 
         full_export = {
-            "project": selected_project,
-            "total_loops": loop_count,
+            "project": project_to_export,
+            "total_loops": loop_count_export,
             "final_status": st.session_state.status,
-            "analyses": all_analyses,
-            "final_code": code_to_test,  # Include the actual fixed code
-            "final_code_length": len(code_to_test),
+            "analyses": all_analyses_export,
+            "final_code": code_to_export,
+            "final_code_length": len(code_to_export),
         }
 
         col_exp1, col_exp2 = st.columns(2)
@@ -1074,22 +1213,24 @@ Return ONLY the complete fixed Python code."""
             st.download_button(
                 "📥 Full Report (JSON)",
                 json.dumps(full_export, indent=2),
-                file_name=f"{selected_project}_analysis_report.json",
-                mime="application/json"
+                file_name=f"{project_to_export}_analysis_report.json",
+                mime="application/json",
+                key="download_json_report"
             )
         with col_exp2:
             # Text report
-            full_text = f"STREAMTEST ANALYSIS REPORT\nProject: {selected_project}\n\n"
-            for item in all_analyses:
+            full_text = f"STREAMTEST ANALYSIS REPORT\nProject: {project_to_export}\n\n"
+            for item in all_analyses_export:
                 full_text += format_analysis_text(item["analysis"], item["loop"]) + "\n\n"
             full_text += "\n\n" + "=" * 60 + "\nFINAL FIXED CODE:\n" + "=" * 60 + "\n\n"
-            full_text += code_to_test
+            full_text += code_to_export
 
             st.download_button(
                 "📥 Full Report (TXT)",
                 full_text,
-                file_name=f"{selected_project}_analysis_report.txt",
-                mime="text/plain"
+                file_name=f"{project_to_export}_analysis_report.txt",
+                mime="text/plain",
+                key="download_txt_report"
             )
 
 
