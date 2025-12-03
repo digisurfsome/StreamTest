@@ -34,14 +34,65 @@ PROJECTS_DIR.mkdir(exist_ok=True)
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
 CLAUDE_HAIKU = "claude-3-5-haiku-20241022"  # Fast & cheap for simple fixes
 
+# =============================================================================
+# CODING STANDARDS - The "Coding Bible" reference for all prompts
+# =============================================================================
+CODING_STANDARDS = """
+## CODING STANDARDS REFERENCE
+
+### Python Best Practices
+- Use type hints for function parameters and return values
+- Handle exceptions specifically, not with bare `except:`
+- Use context managers (`with` statements) for resources
+- Avoid mutable default arguments (use `None` instead of `[]`)
+- Use `secrets.compare_digest()` for secure string comparison
+- Never store sensitive data in session_state (use database)
+
+### Streamlit Best Practices
+- Initialize ALL session_state variables at app start
+- Use unique `key=` for all interactive widgets
+- Store persistent data in database, not session_state
+- Put expensive operations behind `@st.cache_data` or `@st.cache_resource`
+- Use `st.rerun()` sparingly - only when state actually changed
+- Always show user feedback (spinners, success/error messages)
+- Handle the case when session_state values are None/missing
+
+### Database Best Practices
+- Use context managers for database connections (`with get_db() as db:`)
+- Use parameterized queries (never string concatenation for SQL)
+- Store counters/attempts in database for persistence across sessions
+- Use atomic operations (transactions) for multi-step updates
+- Always close database connections properly
+
+### Security
+- Validate all user input before using
+- Use `secrets.compare_digest()` for timing-safe comparisons
+- Never expose API keys or secrets in code
+- Store PIN attempts in database (not session_state) to prevent bypass
+- Implement rate limiting for sensitive operations
+
+### Code Structure
+- Keep functions focused on single responsibility
+- Avoid deep nesting (max 3-4 levels)
+- Use early returns to reduce complexity
+- Group related functionality into modules
+- Document complex logic with comments
+"""
+
 # Default prompts (editable in Settings)
 DEFAULT_ANALYSIS_PROMPT = """You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
 
 1. **Syntax Errors** - Any code that won't run
 2. **Logic Bugs** - Incorrect behavior, edge cases
-3. **Security Issues** - SQL injection, XSS, exposed secrets
-4. **Best Practices** - Missing error handling, poor UX
+3. **Security Issues** - SQL injection, XSS, exposed secrets, session_state security flaws
+4. **Best Practices** - Missing error handling, poor UX, non-persistent data in session_state
 5. **Test Scenarios** - Based on the test steps provided
+
+IMPORTANT: Check violations of these coding standards:
+- Data that should persist (like PIN attempts, counters) must be in DATABASE, not session_state
+- All widgets need unique `key=` parameters
+- Exception handling must be specific, not bare `except:`
+- Use `secrets.compare_digest()` for any sensitive comparisons
 
 Be specific about what code to change. Include actual code snippets."""
 
@@ -53,6 +104,12 @@ RULES:
 3. Don't refactor or improve other parts
 4. Keep all existing functionality
 5. Return the COMPLETE code with just this fix applied
+
+FOLLOW CODING STANDARDS:
+- If storing persistent data, use DATABASE not session_state
+- Use type hints where appropriate
+- Use context managers for database/file operations
+- Specific exception handling (not bare except)
 
 Return ONLY the complete Python code, no explanations."""
 
@@ -834,6 +891,13 @@ RULES:
 4. Keep all existing functionality
 5. Return the COMPLETE code with ALL fixes applied
 
+CODING STANDARDS TO FOLLOW:
+- Persistent data (counters, attempts, state) must be in DATABASE, not session_state
+- Use context managers for database/file operations
+- Use specific exception handling (not bare except)
+- Use `secrets.compare_digest()` for sensitive comparisons
+- All widgets need unique `key=` parameters
+
 Return ONLY the complete Python code, no explanations."""
 
     try:
@@ -865,10 +929,11 @@ def get_issue_fingerprint(issue: dict) -> str:
 
 def verify_fix_worked(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str]:
     """
-    VERIFIER: Uses Haiku for fast verification - checks if the fix actually resolved the issue.
+    VERIFIER: Uses Opus for verification - checks if the fix actually resolved the issue.
+    Decision-making should always use the best model (Opus), not Haiku.
     Returns (fix_worked: bool, reasoning: str)
     """
-    # Use Haiku for verification - it's fast and cheap, and verification is straightforward
+    # Use Opus for verification - decision-making should use the best model
     prompt = f"""You are an independent CODE VERIFIER. Determine if this fix resolved the specific issue.
 
 ISSUE THAT NEEDED FIXING:
@@ -894,9 +959,9 @@ Respond in JSON:
 {{"fix_worked": true/false, "reasoning": "brief explanation"}}"""
 
     try:
-        # Use Haiku for verification - fast and cheap
+        # Use Opus for verification - decision-making needs the best model
         response = client.messages.create(
-            model=CLAUDE_HAIKU,
+            model=CLAUDE_MODEL,
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -1107,10 +1172,10 @@ def test_mode():
                 with col_btn2:
                     copy_text = format_analysis_text(analysis, loop_count)
                     st.download_button(
-                        "📋 Copy All",
-                        copy_text,
+                        "📋 Download Analysis",
+                        copy_text.encode('utf-8'),  # Encode as bytes for proper text file
                         file_name=f"analysis_loop_{loop_count}.txt",
-                        mime="text/plain",
+                        mime="text/plain; charset=utf-8",
                         key=f"copy_{loop_count}"
                     )
 
@@ -1195,8 +1260,8 @@ def test_mode():
                         )
 
                     if was_changed:
-                        # Quick verification with Haiku
-                        with st.spinner("🔍 Haiku verifying batch fix..."):
+                        # Verification with Opus (decision-making needs the best model)
+                        with st.spinner("🔍 Opus verifying batch fix..."):
                             fix_verified, verification_reason = verify_fix_worked(
                                 client, original_code_before_fix, fixed_code, issues_attempted[0]
                             )
@@ -1339,9 +1404,9 @@ def test_mode():
         with col_code1:
             st.download_button(
                 "⬇️ DOWNLOAD FIXED CODE (.py)",
-                code_to_export,
+                code_to_export.encode('utf-8'),  # Encode as bytes for proper file download
                 file_name=f"{project_to_export}_fixed.py",
-                mime="text/x-python",
+                mime="text/x-python; charset=utf-8",
                 type="primary",
                 key="download_fixed_code"
             )
@@ -1367,11 +1432,12 @@ def test_mode():
 
         col_exp1, col_exp2 = st.columns(2)
         with col_exp1:
+            json_data = json.dumps(full_export, indent=2, ensure_ascii=False)
             st.download_button(
                 "📥 Full Report (JSON)",
-                json.dumps(full_export, indent=2),
+                json_data.encode('utf-8'),  # Encode as bytes for proper file download
                 file_name=f"{project_to_export}_analysis_report.json",
-                mime="application/json",
+                mime="application/json; charset=utf-8",
                 key="download_json_report"
             )
         with col_exp2:
@@ -1384,9 +1450,9 @@ def test_mode():
 
             st.download_button(
                 "📥 Full Report (TXT)",
-                full_text,
+                full_text.encode('utf-8'),  # Encode as bytes for proper text file
                 file_name=f"{project_to_export}_analysis_report.txt",
-                mime="text/plain",
+                mime="text/plain; charset=utf-8",
                 key="download_txt_report"
             )
 
