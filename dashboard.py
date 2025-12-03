@@ -123,6 +123,79 @@ CODING_STANDARDS = """
 - Document complex logic with comments
 """
 
+# Categorized coding bible sections for targeted pre-read
+CODING_BIBLE_SECTIONS = {
+    "security": """
+### SECURITY CODING BIBLE (Pre-Read Required)
+- Use `secrets.compare_digest()` for ALL sensitive comparisons (PINs, tokens, passwords)
+- NEVER store sensitive data in session_state - use database
+- Store PIN/login attempts in DATABASE to prevent session refresh bypass
+- Validate ALL user input before using
+- Never expose API keys or secrets in code
+- Implement rate limiting for authentication operations
+- Use parameterized queries - NEVER string concatenation for SQL
+""",
+    "database": """
+### DATABASE CODING BIBLE (Pre-Read Required)
+- Use context managers: `with get_db() as db:`
+- ALWAYS use parameterized queries (?, %s) - never string concat
+- Store persistent counters/state in database, not session_state
+- Use atomic operations (transactions) for multi-step updates
+- Close connections properly - context managers handle this
+- Handle connection errors gracefully with try/except
+""",
+    "streamlit": """
+### STREAMLIT CODING BIBLE (Pre-Read Required)
+- Initialize ALL session_state variables at app start in one place
+- Use unique `key=` parameter for EVERY interactive widget
+- Use `st.rerun()` sparingly - only when state actually changed
+- Put expensive operations behind `@st.cache_data` or `@st.cache_resource`
+- Always show user feedback (spinners, success/error messages)
+- Handle None/missing session_state values with .get() method
+""",
+    "logic": """
+### LOGIC/STRUCTURE CODING BIBLE (Pre-Read Required)
+- Keep functions focused on single responsibility
+- Avoid deep nesting - max 3-4 levels, use early returns
+- Handle exceptions specifically, not bare `except:`
+- Use type hints for function parameters and return values
+- Avoid mutable default arguments (use None instead of [])
+- Use context managers for resources (files, connections)
+""",
+    "best_practice": """
+### BEST PRACTICES CODING BIBLE (Pre-Read Required)
+- Keep functions focused and small (single responsibility)
+- Use descriptive variable names
+- Add comments for complex logic only (code should be self-documenting)
+- Use early returns to reduce nesting
+- Group related imports at top of file
+- Follow consistent naming conventions (snake_case for Python)
+"""
+}
+
+
+def get_relevant_bible_section(issue: dict) -> str:
+    """
+    PRE-READ MECHANISM: Look up the relevant coding bible section
+    based on the issue category. This refreshes the agent's memory
+    about best practices BEFORE it attempts the fix.
+    """
+    category = issue.get("category", "").lower()
+    description = issue.get("description", "").lower()
+
+    # Map issue to bible section
+    if category == "security" or "security" in description or "pin" in description or "auth" in description:
+        return CODING_BIBLE_SECTIONS["security"]
+    elif category == "database" or "database" in description or "db" in description or "sql" in description:
+        return CODING_BIBLE_SECTIONS["database"]
+    elif "session" in description or "widget" in description or "key" in description or "rerun" in description:
+        return CODING_BIBLE_SECTIONS["streamlit"]
+    elif category == "logic" or "logic" in description or "exception" in description or "error" in description:
+        return CODING_BIBLE_SECTIONS["logic"]
+    else:
+        return CODING_BIBLE_SECTIONS["best_practice"]
+
+
 # Default prompts (editable in Settings)
 DEFAULT_ANALYSIS_PROMPT = """You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
 
@@ -803,7 +876,14 @@ Be specific about what code to change. Include actual code snippets."""
 
 def auto_fix_single_issue(client, code: str, issue: dict) -> tuple[str, bool]:
     """Fix ONE specific issue at a time. Returns (new_code, was_changed)."""
+
+    # PRE-READ: Look up relevant coding bible section BEFORE coding
+    bible_section = get_relevant_bible_section(issue)
+
     prompt = f"""Fix ONLY this specific issue in the code. Make the minimal change needed.
+
+**FIRST, READ THIS CODING BIBLE SECTION:**
+{bible_section}
 
 ISSUE TO FIX:
 - Severity: {issue.get('severity', 'unknown')}
@@ -823,6 +903,7 @@ RULES:
 3. Don't refactor or improve other parts
 4. Keep all existing functionality
 5. Return the COMPLETE code with just this fix applied
+6. FOLLOW THE CODING BIBLE SECTION ABOVE
 
 Return ONLY the complete Python code, no explanations."""
 
@@ -882,7 +963,13 @@ def fix_with_haiku(client, code: str, issue: dict) -> tuple[str, bool]:
     Use Haiku for simple fixes - faster and cheaper.
     Returns (new_code, was_changed)
     """
+    # PRE-READ: Even Haiku gets the coding bible section
+    bible_section = get_relevant_bible_section(issue)
+
     prompt = f"""Fix this specific issue in the code. Make the minimal change needed.
+
+**FIRST, READ THIS:**
+{bible_section}
 
 ISSUE:
 - Category: {issue.get('category', 'unknown')}
@@ -933,12 +1020,22 @@ def batch_fix_issues(client, code: str, issues: list, max_issues: int = 3) -> tu
     # Take up to max_issues, prioritizing by severity
     issues_to_fix = issues[:max_issues]
 
+    # PRE-READ: Collect ALL relevant coding bible sections for these issues
+    bible_sections_needed = set()
+    for issue in issues_to_fix:
+        section = get_relevant_bible_section(issue)
+        bible_sections_needed.add(section)
+    combined_bible = "\n".join(bible_sections_needed)
+
     issues_description = "\n".join([
         f"{i+1}. [{issue.get('severity', 'unknown').upper()}] {issue.get('category', 'unknown')}: {issue.get('description', 'unknown')}\n   Fix: {issue.get('fix', 'unknown')}\n   Code: {issue.get('code_snippet', 'N/A')}"
         for i, issue in enumerate(issues_to_fix)
     ])
 
     prompt = f"""Fix ALL of these issues in the code. You are Opus 4.5 - you can handle multiple fixes at once.
+
+**FIRST, READ THESE CODING BIBLE SECTIONS:**
+{combined_bible}
 
 ISSUES TO FIX:
 {issues_description}
@@ -954,13 +1051,7 @@ RULES:
 3. Don't introduce new issues
 4. Keep all existing functionality
 5. Return the COMPLETE code with ALL fixes applied
-
-CODING STANDARDS TO FOLLOW:
-- Persistent data (counters, attempts, state) must be in DATABASE, not session_state
-- Use context managers for database/file operations
-- Use specific exception handling (not bare except)
-- Use `secrets.compare_digest()` for sensitive comparisons
-- All widgets need unique `key=` parameters
+6. FOLLOW THE CODING BIBLE SECTIONS ABOVE
 
 Return ONLY the complete Python code, no explanations."""
 
@@ -1044,20 +1135,30 @@ Respond in JSON:
 
 def multi_agent_vote(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str, dict]:
     """
-    MULTI-AGENT VOTING SYSTEM: Three Opus instances vote on whether fix is good.
+    MULTI-AGENT VOTING SYSTEM - Corrected Flow:
 
-    Agent 1: Reviews the fix
-    Agent 2: Reviews the fix independently
-    Agent 3: Only called if agents 1 and 2 disagree (tiebreaker)
+    Agent 1 = CODER (already made the fix - implicitly approves their own work)
+    Agent 2 = REVIEWER (checks work, says GOOD or proposes CHANGES with snippet + reasoning)
+    Agent 3 = TIEBREAKER (only if Agent 2 proposes changes, then all 3 vote)
 
     Returns (approved: bool, reasoning: str, vote_details: dict)
     """
     st.session_state.voting_used = True
+    votes = []
 
-    vote_prompt = f"""You are AGENT {{agent_num}} in a code review panel.
-Independently evaluate if this code fix is correct and complete.
+    # Agent 1 (CODER) - Already made the fix, implicitly approves
+    votes.append({
+        "agent": 1,
+        "role": "CODER",
+        "vote": "APPROVE",
+        "reasoning": "I made this fix and believe it's correct"
+    })
 
-ISSUE BEING FIXED:
+    # Agent 2 (REVIEWER) - Reviews Agent 1's work
+    reviewer_prompt = f"""You are AGENT 2: THE REVIEWER. Agent 1 (the coder) has made a fix.
+Your job is to review their work and determine if it's correct.
+
+ISSUE THAT WAS SUPPOSED TO BE FIXED:
 - Severity: {issue.get('severity', 'unknown')}
 - Category: {issue.get('category', 'unknown')}
 - Description: {issue.get('description', 'unknown')}
@@ -1065,69 +1166,81 @@ ISSUE BEING FIXED:
 
 ORIGINAL CODE:
 ```python
-{original_code[:3000]}...
+{original_code[:3000]}
 ```
 
-FIXED CODE:
+AGENT 1'S FIXED CODE:
 ```python
-{fixed_code[:3000]}...
+{fixed_code[:3000]}
 ```
 
-VOTE CRITERIA:
-1. Does the fix address the specific issue described?
+REVIEW CRITERIA:
+1. Does the fix address the specific issue?
 2. Does it avoid introducing new bugs?
-3. Is the implementation clean and minimal?
+3. Is it clean and minimal?
 
 Respond in JSON:
-{{"vote": "APPROVE" or "REJECT", "confidence": 1-10, "reasoning": "brief explanation"}}"""
+{{
+    "verdict": "GOOD" or "NEEDS_CHANGES",
+    "reasoning": "explain your assessment",
+    "proposed_fix": "if NEEDS_CHANGES, provide the specific code snippet that should be changed"
+}}"""
 
-    votes = []
-
-    # Agent 1 votes
-    try:
-        response1 = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=500,
-            messages=[{"role": "user", "content": vote_prompt.format(agent_num=1)}]
-        )
-        result1 = response1.content[0].text
-        json_match1 = re.search(r'\{.*\}', result1, re.DOTALL)
-        if json_match1:
-            vote1 = json.loads(json_match1.group())
-            votes.append({"agent": 1, **vote1})
-    except Exception as e:
-        votes.append({"agent": 1, "vote": "ABSTAIN", "reasoning": str(e)})
-
-    # Agent 2 votes
     try:
         response2 = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=500,
-            messages=[{"role": "user", "content": vote_prompt.format(agent_num=2)}]
+            max_tokens=1000,
+            messages=[{"role": "user", "content": reviewer_prompt}]
         )
         result2 = response2.content[0].text
         json_match2 = re.search(r'\{.*\}', result2, re.DOTALL)
         if json_match2:
-            vote2 = json.loads(json_match2.group())
-            votes.append({"agent": 2, **vote2})
+            review = json.loads(json_match2.group())
+            votes.append({
+                "agent": 2,
+                "role": "REVIEWER",
+                "vote": "APPROVE" if review.get("verdict") == "GOOD" else "REJECT",
+                "reasoning": review.get("reasoning", ""),
+                "proposed_fix": review.get("proposed_fix", "")
+            })
     except Exception as e:
-        votes.append({"agent": 2, "vote": "ABSTAIN", "reasoning": str(e)})
+        votes.append({"agent": 2, "role": "REVIEWER", "vote": "ABSTAIN", "reasoning": str(e)})
 
-    # Check if we need tiebreaker
-    approves = sum(1 for v in votes if v.get("vote") == "APPROVE")
-    rejects = sum(1 for v in votes if v.get("vote") == "REJECT")
+    # Check if we need Agent 3 (TIEBREAKER)
+    agent2_vote = votes[1].get("vote") if len(votes) > 1 else "ABSTAIN"
 
-    # If tied (1-1), call Agent 3 as tiebreaker
-    if approves == 1 and rejects == 1:
+    # Only bring in Agent 3 if Agent 2 proposed changes (disagreed with Agent 1)
+    if agent2_vote == "REJECT":
+        agent2_reasoning = votes[1].get("reasoning", "")[:200]
+        agent2_proposed = votes[1].get("proposed_fix", "")[:500]
+
+        tiebreaker_prompt = f"""You are AGENT 3: THE TIEBREAKER.
+
+Agent 1 (CODER) made a fix and believes it's correct.
+Agent 2 (REVIEWER) disagrees and proposes changes.
+
+ISSUE:
+- {issue.get('description', 'unknown')}
+
+AGENT 1'S FIX (in the code):
+```python
+{fixed_code[:2000]}
+```
+
+AGENT 2'S OBJECTION:
+"{agent2_reasoning}"
+
+AGENT 2'S PROPOSED CHANGE:
+"{agent2_proposed}"
+
+YOUR TASK: Cast the deciding vote.
+- Vote APPROVE if Agent 1's fix is good enough (accept it as-is)
+- Vote REJECT if Agent 2 is right (the fix needs changes)
+
+Respond in JSON:
+{{"vote": "APPROVE" or "REJECT", "reasoning": "brief explanation of your decision"}}"""
+
         try:
-            tiebreaker_prompt = vote_prompt.format(agent_num=3) + """
-
-IMPORTANT: You are the TIEBREAKER. Agents 1 and 2 disagreed.
-Agent 1 voted: """ + votes[0].get("vote", "UNKNOWN") + " - " + votes[0].get("reasoning", "")[:100] + """
-Agent 2 voted: """ + votes[1].get("vote", "UNKNOWN") + " - " + votes[1].get("reasoning", "")[:100] + """
-
-Cast the deciding vote."""
-
             response3 = client.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=500,
@@ -1137,25 +1250,30 @@ Cast the deciding vote."""
             json_match3 = re.search(r'\{.*\}', result3, re.DOTALL)
             if json_match3:
                 vote3 = json.loads(json_match3.group())
-                votes.append({"agent": 3, "tiebreaker": True, **vote3})
-                if vote3.get("vote") == "APPROVE":
-                    approves += 1
-                elif vote3.get("vote") == "REJECT":
-                    rejects += 1
+                votes.append({
+                    "agent": 3,
+                    "role": "TIEBREAKER",
+                    "vote": vote3.get("vote", "ABSTAIN"),
+                    "reasoning": vote3.get("reasoning", "")
+                })
         except Exception as e:
-            votes.append({"agent": 3, "vote": "ABSTAIN", "reasoning": str(e)})
+            votes.append({"agent": 3, "role": "TIEBREAKER", "vote": "ABSTAIN", "reasoning": str(e)})
 
-    # Determine final result
+    # Count votes
+    approves = sum(1 for v in votes if v.get("vote") == "APPROVE")
+    rejects = sum(1 for v in votes if v.get("vote") == "REJECT")
+
+    # Determine final result (majority wins)
     approved = approves > rejects
 
     # Build reasoning summary
     reasoning_parts = []
     for v in votes:
         agent = v.get("agent", "?")
+        role = v.get("role", "")
         vote = v.get("vote", "ABSTAIN")
         reason = v.get("reasoning", "")[:50]
-        tiebreaker = " (TIEBREAKER)" if v.get("tiebreaker") else ""
-        reasoning_parts.append(f"Agent {agent}{tiebreaker}: {vote} - {reason}")
+        reasoning_parts.append(f"Agent {agent} ({role}): {vote} - {reason}")
 
     final_reasoning = f"VOTE: {approves} APPROVE, {rejects} REJECT. " + " | ".join(reasoning_parts)
 
@@ -1164,7 +1282,8 @@ Cast the deciding vote."""
         "approves": approves,
         "rejects": rejects,
         "tiebreaker_needed": len(votes) > 2,
-        "final_decision": "APPROVED" if approved else "REJECTED"
+        "final_decision": "APPROVED" if approved else "REJECTED",
+        "reviewer_proposed_fix": votes[1].get("proposed_fix", "") if len(votes) > 1 else ""
     }
 
     return approved, final_reasoning, vote_details
