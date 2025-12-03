@@ -32,6 +32,38 @@ PROJECTS_DIR.mkdir(exist_ok=True)
 
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
+# Default prompts (editable in Settings)
+DEFAULT_ANALYSIS_PROMPT = """You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
+
+1. **Syntax Errors** - Any code that won't run
+2. **Logic Bugs** - Incorrect behavior, edge cases
+3. **Security Issues** - SQL injection, XSS, exposed secrets
+4. **Best Practices** - Missing error handling, poor UX
+5. **Test Scenarios** - Based on the test steps provided
+
+Be specific about what code to change. Include actual code snippets."""
+
+DEFAULT_FIX_PROMPT = """Fix ONLY this specific issue in the code. Make the minimal change needed.
+
+RULES:
+1. Only fix THIS ONE issue
+2. Make minimal changes
+3. Don't refactor or improve other parts
+4. Keep all existing functionality
+5. Return the COMPLETE code with just this fix applied
+
+Return ONLY the complete Python code, no explanations."""
+
+DEFAULT_JUDGE_PROMPT = """You are Code Review Judge. Review the proposed code changes.
+
+Consider:
+1. Will this correctly implement the feature?
+2. Does it follow the surgical edit principle (minimal changes)?
+3. Are there any bugs or issues?
+4. Is anything missing?
+
+Provide your verdict: APPROVE, REJECT, or NEEDS_REVISION."""
+
 
 def init_session_state():
     """Initialize session state variables."""
@@ -42,6 +74,13 @@ def init_session_state():
         "loop_count": 0,
         "status": "idle",
         "planned_changes": [],
+        # Editable prompts
+        "analysis_prompt": DEFAULT_ANALYSIS_PROMPT,
+        "fix_prompt": DEFAULT_FIX_PROMPT,
+        "judge_prompt": DEFAULT_JUDGE_PROMPT,
+        # Store fixed code for download
+        "final_fixed_code": None,
+        "final_project_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -782,13 +821,21 @@ def test_mode():
         height=100
     )
 
-    col_a, col_b, col_c = st.columns(3)
+    # Row 1: Loops and target score
+    col_a, col_b = st.columns(2)
     with col_a:
-        max_loops = st.slider("Max fix attempts", 1, 10, 5)
+        max_loops = st.slider("Max fix attempts", 1, 15, 5)
     with col_b:
-        auto_fix = st.checkbox("Auto-fix issues", value=True)
+        target_score = st.slider("Target score to stop", 80, 100, 90, help="Stop when this score is reached (unless 'Run all loops' is checked)")
+
+    # Row 2: Checkboxes
+    col_c, col_d, col_e = st.columns(3)
     with col_c:
+        auto_fix = st.checkbox("Auto-fix issues", value=True)
+    with col_d:
         fix_one_at_time = st.checkbox("Fix one at a time", value=True, help="Fixes most critical issue first, then re-analyzes")
+    with col_e:
+        run_all_loops = st.checkbox("Run all loops", value=False, help="Ignore target score, run all loops regardless")
 
     if st.button("🚀 Start Analysis", type="primary"):
         client = get_client()
@@ -877,13 +924,22 @@ def test_mode():
 
             st.write(f"**Summary:** {analysis.get('summary', 'N/A')}")
 
-            # Check if passing
+            # Store the current fixed code for later download
+            st.session_state.final_fixed_code = code_to_test
+            st.session_state.final_project_name = selected_project
+
+            # Check if passing (unless run_all_loops is enabled)
             critical_issues = [i for i in issues if i.get("severity") in ["critical", "high"]]
 
-            if score >= 90 and not critical_issues:
-                st.success("🎉 Code passed all checks!")
+            if not run_all_loops and score >= target_score and not critical_issues:
+                st.success(f"🎉 Code passed! Score {score} >= target {target_score}")
                 st.session_state.status = "passed"
                 add_log(f"Test PASSED: {selected_project} (score: {score})")
+                break
+            elif run_all_loops and loop_count >= max_loops:
+                st.info(f"📊 Completed all {max_loops} loops. Final score: {score}")
+                if score >= target_score:
+                    st.session_state.status = "passed"
                 break
 
             # Auto-fix if enabled
@@ -980,18 +1036,43 @@ Return ONLY the complete fixed Python code."""
         st.divider()
         st.subheader("📥 Export Results")
 
+        # MOST IMPORTANT: Download Fixed Code button
+        st.markdown("### 🔧 Fixed Code")
+        st.success(f"Final code ready for download ({len(code_to_test)} characters)")
+
+        col_code1, col_code2 = st.columns(2)
+        with col_code1:
+            st.download_button(
+                "⬇️ DOWNLOAD FIXED CODE (.py)",
+                code_to_test,
+                file_name=f"{selected_project}_fixed.py",
+                mime="text/x-python",
+                type="primary"
+            )
+        with col_code2:
+            # Show code in expander with line count
+            line_count = len(code_to_test.split('\n'))
+            with st.expander(f"📄 View Fixed Code ({line_count} lines)"):
+                st.code(code_to_test, language="python")
+
+        st.divider()
+
+        # Reports section
+        st.markdown("### 📊 Analysis Reports")
+
         full_export = {
             "project": selected_project,
             "total_loops": loop_count,
             "final_status": st.session_state.status,
             "analyses": all_analyses,
+            "final_code": code_to_test,  # Include the actual fixed code
             "final_code_length": len(code_to_test),
         }
 
         col_exp1, col_exp2 = st.columns(2)
         with col_exp1:
             st.download_button(
-                "📥 Download Full Report (JSON)",
+                "📥 Full Report (JSON)",
                 json.dumps(full_export, indent=2),
                 file_name=f"{selected_project}_analysis_report.json",
                 mime="application/json"
@@ -1001,13 +1082,135 @@ Return ONLY the complete fixed Python code."""
             full_text = f"STREAMTEST ANALYSIS REPORT\nProject: {selected_project}\n\n"
             for item in all_analyses:
                 full_text += format_analysis_text(item["analysis"], item["loop"]) + "\n\n"
+            full_text += "\n\n" + "=" * 60 + "\nFINAL FIXED CODE:\n" + "=" * 60 + "\n\n"
+            full_text += code_to_test
 
             st.download_button(
-                "📥 Download Full Report (TXT)",
+                "📥 Full Report (TXT)",
                 full_text,
                 file_name=f"{selected_project}_analysis_report.txt",
                 mime="text/plain"
             )
+
+
+# =============================================================================
+# SETTINGS MODE - Edit prompts and configuration
+# =============================================================================
+
+def settings_mode():
+    """Settings page for editing prompts and configuration."""
+    st.header("⚙️ Settings")
+
+    st.markdown("""
+    **Customize the AI prompts** that control how StreamTest analyzes and fixes code.
+    These prompts are the "personality" that guides Claude's behavior.
+    """)
+
+    # Analysis Prompt
+    st.subheader("📊 Analysis Prompt")
+    st.caption("This prompt tells Claude how to analyze code for issues")
+
+    analysis_prompt = st.text_area(
+        "Analysis Prompt",
+        value=st.session_state.analysis_prompt,
+        height=200,
+        key="edit_analysis_prompt"
+    )
+
+    col_a1, col_a2 = st.columns([1, 4])
+    with col_a1:
+        if st.button("💾 Save", key="save_analysis"):
+            st.session_state.analysis_prompt = analysis_prompt
+            st.success("Analysis prompt saved!")
+    with col_a2:
+        if st.button("🔄 Reset to Default", key="reset_analysis"):
+            st.session_state.analysis_prompt = DEFAULT_ANALYSIS_PROMPT
+            st.success("Reset to default!")
+            st.rerun()
+
+    st.divider()
+
+    # Fix Prompt
+    st.subheader("🔧 Fix Prompt")
+    st.caption("This prompt tells Claude how to fix individual issues")
+
+    fix_prompt = st.text_area(
+        "Fix Prompt",
+        value=st.session_state.fix_prompt,
+        height=200,
+        key="edit_fix_prompt"
+    )
+
+    col_f1, col_f2 = st.columns([1, 4])
+    with col_f1:
+        if st.button("💾 Save", key="save_fix"):
+            st.session_state.fix_prompt = fix_prompt
+            st.success("Fix prompt saved!")
+    with col_f2:
+        if st.button("🔄 Reset to Default", key="reset_fix"):
+            st.session_state.fix_prompt = DEFAULT_FIX_PROMPT
+            st.success("Reset to default!")
+            st.rerun()
+
+    st.divider()
+
+    # Judge Prompt
+    st.subheader("⚖️ Judge Prompt (Multi-Agent Review)")
+    st.caption("This prompt tells the Judge Claudes how to review code changes")
+
+    judge_prompt = st.text_area(
+        "Judge Prompt",
+        value=st.session_state.judge_prompt,
+        height=200,
+        key="edit_judge_prompt"
+    )
+
+    col_j1, col_j2 = st.columns([1, 4])
+    with col_j1:
+        if st.button("💾 Save", key="save_judge"):
+            st.session_state.judge_prompt = judge_prompt
+            st.success("Judge prompt saved!")
+    with col_j2:
+        if st.button("🔄 Reset to Default", key="reset_judge"):
+            st.session_state.judge_prompt = DEFAULT_JUDGE_PROMPT
+            st.success("Reset to default!")
+            st.rerun()
+
+    st.divider()
+
+    # Tips section
+    with st.expander("💡 Tips for Writing Effective Prompts"):
+        st.markdown("""
+        **What makes prompts effective:**
+
+        1. **Clear Role Definition**
+           - "You are a senior Python developer..."
+           - "You are a security expert..."
+
+        2. **Explicit Rules (MOST IMPORTANT)**
+           - "NEVER do X"
+           - "ALWAYS do Y"
+           - "If Z happens, do W"
+
+        3. **Structured Output Format**
+           - "Respond in this exact JSON format:..."
+           - Specify exact field names and types
+
+        4. **Examples**
+           - Show good and bad examples
+           - "Here's what a good response looks like:..."
+
+        5. **Priority Ordering**
+           - "Most important: X. Second priority: Y..."
+
+        6. **Negative Examples**
+           - "Do NOT do this: [example of bad output]"
+
+        **Why Claude Code follows instructions better than ChatGPT:**
+        - System prompts are heavily weighted
+        - Trained specifically for instruction-following
+        - Responds well to NEVER/ALWAYS rules
+        """)
 
 
 # =============================================================================
@@ -1022,8 +1225,8 @@ def render_sidebar():
         # Mode selection
         mode = st.radio(
             "Mode",
-            ["BUILD", "EDIT", "TEST"],
-            index=["BUILD", "EDIT", "TEST"].index(st.session_state.mode)
+            ["BUILD", "EDIT", "TEST", "SETTINGS"],
+            index=["BUILD", "EDIT", "TEST", "SETTINGS"].index(st.session_state.mode) if st.session_state.mode in ["BUILD", "EDIT", "TEST", "SETTINGS"] else 2
         )
         st.session_state.mode = mode
 
@@ -1102,6 +1305,8 @@ def main():
         build_mode()
     elif st.session_state.mode == "EDIT":
         edit_mode()
+    elif st.session_state.mode == "SETTINGS":
+        settings_mode()
     else:
         test_mode()
 
