@@ -30,7 +30,9 @@ load_dotenv()
 PROJECTS_DIR = Path("projects")
 PROJECTS_DIR.mkdir(exist_ok=True)
 
+# Model Configuration - Opus for complex tasks, Haiku for simple fixes
 CLAUDE_MODEL = "claude-opus-4-5-20251101"
+CLAUDE_HAIKU = "claude-3-5-haiku-20241022"  # Fast & cheap for simple fixes
 
 # Default prompts (editable in Settings)
 DEFAULT_ANALYSIS_PROMPT = """You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
@@ -725,46 +727,177 @@ Return ONLY the complete Python code, no explanations."""
         return code, False
 
 
-def verify_fix_worked(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str]:
+def should_use_haiku(issue: dict) -> bool:
     """
-    VERIFIER: Independent Opus instance checks if the fix actually resolved the issue.
-    Returns (fix_worked: bool, reasoning: str)
+    Determine if Haiku can handle this fix (simple issues) or if we need Opus (complex issues).
+    Haiku handles: LOW severity, best_practice category, simple refactoring
+    Opus handles: CRITICAL/HIGH severity, security issues, complex logic bugs
     """
-    prompt = f"""You are an independent CODE VERIFIER. Your job is to determine if a fix actually resolved the issue it was meant to fix.
+    severity = issue.get('severity', 'medium').lower()
+    category = issue.get('category', '').lower()
 
-ORIGINAL ISSUE THAT NEEDED FIXING:
-- Severity: {issue.get('severity', 'unknown')}
+    # Always use Opus for critical/high severity
+    if severity in ['critical', 'high']:
+        return False
+
+    # Always use Opus for security issues
+    if category == 'security':
+        return False
+
+    # Use Haiku for low severity and best practices
+    if severity == 'low' or category == 'best_practice':
+        return True
+
+    # Medium severity - check category
+    if category in ['best_practice', 'style', 'documentation']:
+        return True
+
+    # Default to Opus for anything else
+    return False
+
+
+def fix_with_haiku(client, code: str, issue: dict) -> tuple[str, bool]:
+    """
+    Use Haiku for simple fixes - faster and cheaper.
+    Returns (new_code, was_changed)
+    """
+    prompt = f"""Fix this specific issue in the code. Make the minimal change needed.
+
+ISSUE:
 - Category: {issue.get('category', 'unknown')}
 - Description: {issue.get('description', 'unknown')}
-- Suggested Fix: {issue.get('fix', 'unknown')}
-- Code that needed changing: {issue.get('code_snippet', 'N/A')}
+- Fix: {issue.get('fix', 'unknown')}
+- Code to change: {issue.get('code_snippet', 'N/A')}
 
-ORIGINAL CODE (BEFORE FIX):
+CODE:
 ```python
-{original_code[:3000]}  # Truncated for context
+{code}
 ```
 
-FIXED CODE (AFTER FIX):
+Return ONLY the complete fixed Python code, no explanations."""
+
+    try:
+        response = client.messages.create(
+            model=CLAUDE_HAIKU,
+            max_tokens=8000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        if "```python" in result:
+            result = result.split("```python")[1].split("```")[0]
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0]
+
+        new_code = result.strip()
+        was_changed = new_code != code and len(new_code) > 100
+        return new_code, was_changed
+    except Exception as e:
+        st.warning(f"Haiku fix error: {e}")
+        return code, False
+
+
+def batch_fix_issues(client, code: str, issues: list, max_issues: int = 3) -> tuple[str, bool, list]:
+    """
+    Fix multiple non-conflicting issues at once with Opus.
+    Returns (new_code, was_changed, issues_attempted)
+
+    Groups issues by category and fixes up to max_issues at once.
+    This is MORE EFFICIENT than one-at-a-time for Opus 4.5.
+    """
+    if not issues:
+        return code, False, []
+
+    # Take up to max_issues, prioritizing by severity
+    issues_to_fix = issues[:max_issues]
+
+    issues_description = "\n".join([
+        f"{i+1}. [{issue.get('severity', 'unknown').upper()}] {issue.get('category', 'unknown')}: {issue.get('description', 'unknown')}\n   Fix: {issue.get('fix', 'unknown')}\n   Code: {issue.get('code_snippet', 'N/A')}"
+        for i, issue in enumerate(issues_to_fix)
+    ])
+
+    prompt = f"""Fix ALL of these issues in the code. You are Opus 4.5 - you can handle multiple fixes at once.
+
+ISSUES TO FIX:
+{issues_description}
+
+CURRENT CODE:
 ```python
-{fixed_code[:3000]}  # Truncated for context
+{code}
 ```
 
-IMPORTANT: You are verifying whether THIS SPECIFIC ISSUE was fixed, not looking for other issues.
+RULES:
+1. Fix ALL listed issues in one pass
+2. Make clean, minimal changes
+3. Don't introduce new issues
+4. Keep all existing functionality
+5. Return the COMPLETE code with ALL fixes applied
 
-Analyze the changes and respond in this exact JSON format:
-{{
-    "fix_worked": true/false,
-    "reasoning": "Brief explanation of why the fix did or did not address the specific issue",
-    "changes_made": "What actually changed in the code",
-    "issue_still_present": true/false
-}}
-
-Be objective. Only say fix_worked=true if the specific issue described was actually addressed."""
+Return ONLY the complete Python code, no explanations."""
 
     try:
         response = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1000,
+            max_tokens=16000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result = response.content[0].text
+
+        if "```python" in result:
+            result = result.split("```python")[1].split("```")[0]
+        elif "```" in result:
+            result = result.split("```")[1].split("```")[0]
+
+        new_code = result.strip()
+        was_changed = new_code != code and len(new_code) > 100
+        return new_code, was_changed, issues_to_fix
+    except Exception as e:
+        st.error(f"Batch fix error: {e}")
+        return code, False, []
+
+
+def get_issue_fingerprint(issue: dict) -> str:
+    """Create a unique fingerprint for an issue to detect duplicates."""
+    return f"{issue.get('category', '')}:{issue.get('description', '')[:50]}:{issue.get('line', '')}"
+
+
+def verify_fix_worked(client, original_code: str, fixed_code: str, issue: dict) -> tuple[bool, str]:
+    """
+    VERIFIER: Uses Haiku for fast verification - checks if the fix actually resolved the issue.
+    Returns (fix_worked: bool, reasoning: str)
+    """
+    # Use Haiku for verification - it's fast and cheap, and verification is straightforward
+    prompt = f"""You are an independent CODE VERIFIER. Determine if this fix resolved the specific issue.
+
+ISSUE THAT NEEDED FIXING:
+- Severity: {issue.get('severity', 'unknown')}
+- Category: {issue.get('category', 'unknown')}
+- Description: {issue.get('description', 'unknown')}
+- Suggested Fix: {issue.get('fix', 'unknown')}
+- Code snippet: {issue.get('code_snippet', 'N/A')}
+
+ORIGINAL CODE:
+```python
+{original_code}
+```
+
+FIXED CODE:
+```python
+{fixed_code}
+```
+
+TASK: Did the fix address THIS SPECIFIC issue? Don't look for new issues.
+
+Respond in JSON:
+{{"fix_worked": true/false, "reasoning": "brief explanation"}}"""
+
+    try:
+        # Use Haiku for verification - fast and cheap
+        response = client.messages.create(
+            model=CLAUDE_HAIKU,
+            max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
 
@@ -825,10 +958,11 @@ def test_mode():
 
     st.markdown("""
     **Automated Code Analysis & Fix Loop**:
-    1. Claude analyzes your code for issues
+    1. **Opus 4.5** analyzes your code for issues
     2. Shows problems with severity ratings
-    3. Fixes ONE issue at a time (most critical first)
-    4. Re-analyzes to verify fix worked
+    3. **Multiple fix modes**: Batch (3 at once), Smart Delegation, or One-at-a-time
+    4. **Haiku** handles simple fixes (10x cheaper), **Opus** handles complex ones
+    5. Re-analyzes to verify fixes worked
     """)
 
     # Project selection
@@ -888,14 +1022,25 @@ def test_mode():
     with col_b:
         target_score = st.slider("Target score to stop", 80, 100, 90, help="Stop when this score is reached (unless 'Run all loops' is checked)")
 
-    # Row 2: Checkboxes
-    col_c, col_d, col_e = st.columns(3)
+    # Row 2: Fix Mode Selection
+    col_c, col_d = st.columns(2)
     with col_c:
         auto_fix = st.checkbox("Auto-fix issues", value=True)
     with col_d:
-        fix_one_at_time = st.checkbox("Fix one at a time", value=True, help="Fixes most critical issue first, then re-analyzes")
-    with col_e:
         run_all_loops = st.checkbox("Run all loops", value=False, help="Ignore target score, run all loops regardless")
+
+    # Row 3: Advanced Fix Options
+    col_f, col_g, col_h = st.columns(3)
+    with col_f:
+        fix_mode = st.selectbox(
+            "Fix Mode",
+            ["Batch (3 at once)", "One at a time", "Smart Delegation"],
+            help="Batch: Opus fixes 3 issues per round. One-at-a-time: Original slow mode. Smart: Haiku for simple, Opus for complex."
+        )
+    with col_g:
+        use_haiku = st.checkbox("Use Haiku for simple fixes", value=True, help="LOW severity & best_practice fixes use Haiku (10x cheaper)")
+    with col_h:
+        skip_duplicates = st.checkbox("Skip duplicate issues", value=True, help="Don't try to fix issues that look the same as previous attempts")
 
     # Clear results button (only show if we have results)
     col_start, col_clear = st.columns([3, 1])
@@ -1022,129 +1167,141 @@ def test_mode():
 
             # Auto-fix if enabled
             if auto_fix and issues and loop_count < max_loops:
-                if fix_one_at_time:
-                    # Fix most critical issue only
-                    issue_to_fix = sorted_issues[0]
-                    st.info(f"🔧 Fixing most critical issue: [{issue_to_fix.get('severity', 'unknown').upper()}] {issue_to_fix.get('description', '')[:50]}...")
+                # Filter out duplicate issues if enabled
+                issues_to_process = sorted_issues
+                if skip_duplicates:
+                    issues_to_process = [
+                        issue for issue in sorted_issues
+                        if get_issue_fingerprint(issue) not in fixed_issue_ids
+                    ]
+                    if len(issues_to_process) < len(sorted_issues):
+                        st.info(f"⏭️ Skipped {len(sorted_issues) - len(issues_to_process)} duplicate issue(s)")
 
-                    # Store original code for verification
-                    original_code_before_fix = code_to_test
+                if not issues_to_process:
+                    st.warning("All remaining issues are duplicates. Moving to next loop...")
+                    continue
 
-                    with st.spinner("Claude fixing this specific issue..."):
-                        fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+                original_code_before_fix = code_to_test
+
+                # ================================================================
+                # FIX MODE: BATCH (3 at once) - Let Opus handle multiple issues
+                # ================================================================
+                if fix_mode == "Batch (3 at once)":
+                    st.info(f"🔧 **BATCH MODE**: Fixing up to 3 issues at once with Opus 4.5...")
+
+                    with st.spinner("Opus 4.5 fixing multiple issues in one pass..."):
+                        fixed_code, was_changed, issues_attempted = batch_fix_issues(
+                            client, code_to_test, issues_to_process, max_issues=3
+                        )
 
                     if was_changed:
-                        # VERIFICATION STEP: Independent check if fix actually worked
-                        with st.spinner("🔍 Verifier checking if fix actually resolved the issue..."):
+                        # Quick verification with Haiku
+                        with st.spinner("🔍 Haiku verifying batch fix..."):
+                            fix_verified, verification_reason = verify_fix_worked(
+                                client, original_code_before_fix, fixed_code, issues_attempted[0]
+                            )
+
+                        if fix_verified:
+                            code_to_test = fixed_code
+                            for issue in issues_attempted:
+                                fixed_issue_ids.add(get_issue_fingerprint(issue))
+                            previous_issues = issues_attempted
+
+                            app_file.write_text(fixed_code, encoding="utf-8")
+                            add_log(f"Batch fix applied ({len(issues_attempted)} issues) - loop {loop_count}")
+
+                            st.success(f"✅ Batch fix verified! Fixed {len(issues_attempted)} issues at once")
+                            with st.expander("View fixed code"):
+                                st.code(fixed_code, language="python")
+                            continue
+                        else:
+                            st.warning(f"⚠️ Batch fix rejected: {verification_reason[:80]}")
+                            # Fall back to one-at-a-time for this loop
+                            st.info("Falling back to single issue fix...")
+
+                # ================================================================
+                # FIX MODE: SMART DELEGATION - Haiku for simple, Opus for complex
+                # ================================================================
+                elif fix_mode == "Smart Delegation":
+                    issue_to_fix = issues_to_process[0]
+                    use_haiku_for_this = use_haiku and should_use_haiku(issue_to_fix)
+
+                    if use_haiku_for_this:
+                        st.info(f"🐦 **HAIKU** fixing simple issue: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
+                        with st.spinner("Haiku fixing (fast & cheap)..."):
+                            fixed_code, was_changed = fix_with_haiku(client, code_to_test, issue_to_fix)
+                    else:
+                        st.info(f"🧠 **OPUS** fixing complex issue: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:40]}...")
+                        with st.spinner("Opus 4.5 fixing..."):
+                            fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+
+                    if was_changed:
+                        with st.spinner("🔍 Verifying fix..."):
                             fix_verified, verification_reason = verify_fix_worked(
                                 client, original_code_before_fix, fixed_code, issue_to_fix
                             )
 
                         if fix_verified:
-                            st.success(f"✅ Verifier confirmed: {verification_reason[:100]}")
                             code_to_test = fixed_code
-                            fixed_issue_ids.add(issue_to_fix.get("id", f"issue_0"))
+                            fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
                             previous_issues = [issue_to_fix]
 
-                            # Save fixed code
                             app_file.write_text(fixed_code, encoding="utf-8")
-                            add_log(f"Applied verified fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
+                            model_used = "Haiku" if use_haiku_for_this else "Opus"
+                            add_log(f"[{model_used}] Fixed: {issue_to_fix.get('description', '')[:30]}...")
 
-                            with st.expander("View fixed code"):
-                                st.code(fixed_code, language="python")
-
-                            st.success("✅ Fix verified and applied, re-analyzing...")
+                            st.success(f"✅ Fix verified ({model_used}): {verification_reason[:60]}")
                             continue
                         else:
-                            # Verification failed - fix didn't actually work
-                            st.warning(f"⚠️ Verifier rejected fix: {verification_reason[:100]}")
-                            add_log(f"Fix rejected by verifier: {verification_reason[:50]}...")
-
-                            # Try next issue instead
-                            if len(sorted_issues) > 1:
-                                st.info("Trying next issue instead...")
-                                issue_to_fix = sorted_issues[1]
-                                original_code_before_fix = code_to_test
-
-                                with st.spinner("Claude fixing alternative issue..."):
-                                    fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
-
-                                if was_changed:
-                                    with st.spinner("🔍 Verifying alternative fix..."):
-                                        fix_verified, verification_reason = verify_fix_worked(
-                                            client, original_code_before_fix, fixed_code, issue_to_fix
-                                        )
-
-                                    if fix_verified:
-                                        code_to_test = fixed_code
-                                        app_file.write_text(fixed_code, encoding="utf-8")
-                                        add_log(f"Applied alternative fix (loop {loop_count})")
-                                        st.success(f"✅ Alternative fix verified: {verification_reason[:80]}")
-                                        continue
-
-                            st.warning("Could not find a verified fix. Moving to next analysis loop...")
-                            continue
+                            st.warning(f"⚠️ Fix rejected: {verification_reason[:80]}")
                     else:
-                        st.warning("⚠️ Could not apply fix for this issue. Trying next...")
-                        # Try next issue
-                        if len(sorted_issues) > 1:
-                            issue_to_fix = sorted_issues[1]
-                            original_code_before_fix = code_to_test
-                            with st.spinner("Trying next issue..."):
-                                fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
-                            if was_changed:
-                                # Verify the alternative fix too
-                                with st.spinner("🔍 Verifying fix..."):
-                                    fix_verified, _ = verify_fix_worked(client, original_code_before_fix, fixed_code, issue_to_fix)
-                                if fix_verified:
-                                    code_to_test = fixed_code
-                                    app_file.write_text(fixed_code, encoding="utf-8")
-                                    add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
-                                    continue
-                        break
-                else:
-                    # Fix all issues at once (old behavior)
-                    st.info("🔧 Auto-fixing all issues...")
-                    prompt = f"""Fix ALL these issues in the code:
+                        st.warning("Could not apply fix")
 
-{json.dumps(issues, indent=2)}
-
-CURRENT CODE:
-```python
-{code_to_test}
-```
-
-Return ONLY the complete fixed Python code."""
-
-                    with st.spinner("Claude fixing code..."):
-                        try:
-                            response = client.messages.create(
-                                model=CLAUDE_MODEL,
-                                max_tokens=8000,
-                                messages=[{"role": "user", "content": prompt}]
-                            )
-                            result = response.content[0].text
-                            if "```python" in result:
-                                result = result.split("```python")[1].split("```")[0]
-                            fixed_code = result.strip()
-                        except Exception as e:
-                            st.error(f"Fix error: {e}")
-                            break
-
-                    if fixed_code != code_to_test:
-                        code_to_test = fixed_code
-                        app_file.write_text(fixed_code, encoding="utf-8")
-                        add_log(f"Applied fixes (loop {loop_count})")
-                        previous_issues = issues
-
-                        with st.expander("View fixed code"):
-                            st.code(fixed_code, language="python")
-
-                        st.success("✅ Fixes applied, re-analyzing...")
+                    # Try next issue if first failed
+                    if len(issues_to_process) > 1:
+                        st.info("Trying next issue...")
                         continue
+                    break
+
+                # ================================================================
+                # FIX MODE: ONE AT A TIME (original behavior)
+                # ================================================================
+                else:  # "One at a time"
+                    issue_to_fix = issues_to_process[0]
+                    st.info(f"🔧 Fixing: [{issue_to_fix.get('severity', '').upper()}] {issue_to_fix.get('description', '')[:50]}...")
+
+                    # Use Haiku for simple issues if enabled
+                    if use_haiku and should_use_haiku(issue_to_fix):
+                        st.caption("Using Haiku (simple fix)")
+                        with st.spinner("Haiku fixing..."):
+                            fixed_code, was_changed = fix_with_haiku(client, code_to_test, issue_to_fix)
                     else:
-                        st.warning("No changes made by auto-fix")
-                        break
+                        with st.spinner("Opus fixing..."):
+                            fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
+
+                    if was_changed:
+                        with st.spinner("🔍 Verifying..."):
+                            fix_verified, verification_reason = verify_fix_worked(
+                                client, original_code_before_fix, fixed_code, issue_to_fix
+                            )
+
+                        if fix_verified:
+                            code_to_test = fixed_code
+                            fixed_issue_ids.add(get_issue_fingerprint(issue_to_fix))
+                            previous_issues = [issue_to_fix]
+
+                            app_file.write_text(fixed_code, encoding="utf-8")
+                            add_log(f"Fixed: {issue_to_fix.get('description', '')[:30]}...")
+
+                            st.success(f"✅ Verified: {verification_reason[:80]}")
+                            continue
+                        else:
+                            st.warning(f"⚠️ Rejected: {verification_reason[:80]}")
+
+                    # Try next issue
+                    if len(issues_to_process) > 1:
+                        continue
+                    break
             else:
                 if not auto_fix:
                     st.info("Auto-fix disabled. Enable to automatically fix issues.")
