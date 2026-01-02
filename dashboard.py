@@ -30,7 +30,7 @@ load_dotenv()
 PROJECTS_DIR = Path("projects")
 PROJECTS_DIR.mkdir(exist_ok=True)
 
-CLAUDE_MODEL = "claude-opus-4-5-20250929"  # Opus 4.5 - the ONLY model for coding
+CLAUDE_MODEL = "claude-opus-4-5-20251101"  # Opus 4.5 - the ONLY model for coding
 
 # Default prompts (editable in Settings)
 DEFAULT_ANALYSIS_PROMPT = """You are a senior Python developer and QA engineer. Analyze this Streamlit app code for:
