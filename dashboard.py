@@ -174,13 +174,15 @@ def build_mode():
         project_dir.mkdir(exist_ok=True)
 
         with st.spinner("Claude is building your app..."):
+            default_rules = "- Use Streamlit for UI\n- Keep code clean and simple\n- Handle errors gracefully"
+            rules_text = build_rules if build_rules else default_rules
             prompt = f"""You are an expert Python/Streamlit developer. Create a complete, working Streamlit app based on this description:
 
 DESCRIPTION:
 {description}
 
 RULES:
-{build_rules if build_rules else "- Use Streamlit for UI\n- Keep code clean and simple\n- Handle errors gracefully"}
+{rules_text}
 
 Respond with the complete Python code for a file called 'app.py'.
 Only output the Python code, no explanations.
@@ -759,6 +761,249 @@ def format_analysis_text(analysis: dict, loop_num: int) -> str:
     return "\n".join(lines)
 
 
+# =============================================================================
+# TEST MODE HELPER FUNCTIONS
+# =============================================================================
+
+def _render_score_indicator(score: int) -> None:
+    """Display score with appropriate color and message."""
+    if score >= 90:
+        st.success(f"✅ Score: {score}/100 - Excellent!")
+    elif score >= 70:
+        st.warning(f"⚠️ Score: {score}/100 - Needs improvement")
+    else:
+        st.error(f"❌ Score: {score}/100 - Significant issues")
+    st.progress(score / 100)
+
+
+def _render_issues_list(analysis: dict, loop_count: int, fixed_issue_ids: set) -> list:
+    """
+    Display issues with expand/copy buttons.
+    Returns sorted issues list for further processing.
+    """
+    issues = analysis.get("issues", [])
+    if not issues:
+        return []
+
+    # Action buttons row
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
+    with col_btn1:
+        expand_all = st.checkbox("📂 Expand All", key=f"expand_{loop_count}")
+    with col_btn2:
+        copy_text = format_analysis_text(analysis, loop_count)
+        st.download_button(
+            "📋 Copy All",
+            copy_text,
+            file_name=f"analysis_loop_{loop_count}.txt",
+            mime="text/plain",
+            key=f"copy_{loop_count}"
+        )
+
+    st.write(f"**Found {len(issues)} issue(s):**")
+
+    # Sort by severity (critical first)
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    sorted_issues = sorted(issues, key=lambda x: severity_order.get(x.get("severity", "low"), 4))
+
+    # Display each issue
+    severity_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
+    for idx, issue in enumerate(sorted_issues):
+        severity = issue.get("severity", "low")
+        icon = severity_icons.get(severity, "⚪")
+        issue_id = issue.get("id", f"issue_{idx}")
+        fixed_marker = " (STILL PRESENT)" if issue_id in fixed_issue_ids else ""
+        description_preview = issue.get('description', 'Unknown')[:50]
+
+        with st.expander(f"{icon} [{severity.upper()}] {description_preview}...{fixed_marker}", expanded=expand_all):
+            st.write(f"**Category:** {issue.get('category', 'N/A')}")
+            st.write(f"**Line:** {issue.get('line', 'N/A')}")
+            st.write(f"**Description:** {issue.get('description', 'N/A')}")
+            st.write(f"**Fix:** {issue.get('fix', 'N/A')}")
+            if issue.get('code_snippet'):
+                st.code(issue.get('code_snippet', ''), language="python")
+
+    return sorted_issues
+
+
+def _render_test_results(test_results: list) -> None:
+    """Display test results with status icons."""
+    if not test_results:
+        return
+
+    st.write("**Test Results:**")
+    status_icons = {"pass": "✅", "fail": "❌", "warning": "⚠️"}
+    for test in test_results:
+        status = test.get("status", "unknown")
+        icon = status_icons.get(status, "❓")
+        st.write(f"{icon} {test.get('step', 'Unknown')} - {test.get('notes', '')}")
+
+
+def _should_stop_analysis(score: int, issues: list, target_score: int,
+                          run_all_loops: bool, loop_count: int, max_loops: int) -> tuple:
+    """
+    Determine if analysis loop should stop.
+    Returns: (should_stop, message, new_status)
+    """
+    critical_issues = [i for i in issues if i.get("severity") in ["critical", "high"]]
+
+    # Check if passed target (unless run_all_loops is enabled)
+    if not run_all_loops and score >= target_score and not critical_issues:
+        return (True, f"🎉 Code passed! Score {score} >= target {target_score}", "passed")
+
+    # Check if completed all loops
+    if run_all_loops and loop_count >= max_loops:
+        status = "passed" if score >= target_score else None
+        return (True, f"📊 Completed all {max_loops} loops. Final score: {score}", status)
+
+    return (False, None, None)
+
+
+def _apply_single_issue_fix(client, code: str, sorted_issues: list,
+                            fixed_issue_ids: set, app_file: Path, loop_count: int) -> tuple:
+    """
+    Fix the most critical issue only.
+    Returns: (new_code, was_changed, issue_fixed)
+    """
+    # Try to fix most critical issue first
+    for attempt_idx, issue_to_fix in enumerate(sorted_issues[:2]):  # Try top 2 issues max
+        severity = issue_to_fix.get('severity', 'unknown').upper()
+        description = issue_to_fix.get('description', '')[:50]
+
+        if attempt_idx == 0:
+            st.info(f"🔧 Fixing most critical issue: [{severity}] {description}...")
+        else:
+            st.warning("⚠️ Could not apply fix for previous issue. Trying next...")
+
+        with st.spinner("Claude fixing this specific issue..."):
+            fixed_code, was_changed = auto_fix_single_issue(client, code, issue_to_fix)
+
+        if was_changed:
+            fixed_issue_ids.add(issue_to_fix.get("id", f"issue_{attempt_idx}"))
+            app_file.write_text(fixed_code, encoding="utf-8")
+            add_log(f"Applied fix (loop {loop_count}): {description}...")
+
+            with st.expander("View fixed code"):
+                st.code(fixed_code, language="python")
+
+            st.success("✅ Fix applied, re-analyzing to verify...")
+            return (fixed_code, True, issue_to_fix)
+
+    return (code, False, None)
+
+
+def _apply_all_issues_fix(client, code: str, issues: list,
+                          app_file: Path, loop_count: int) -> tuple:
+    """
+    Fix all issues at once.
+    Returns: (new_code, was_changed, issues_fixed)
+    """
+    st.info("🔧 Auto-fixing all issues...")
+
+    prompt = f"""Fix ALL these issues in the code:
+
+{json.dumps(issues, indent=2)}
+
+CURRENT CODE:
+```python
+{code}
+```
+
+Return ONLY the complete fixed Python code."""
+
+    with st.spinner("Claude fixing code..."):
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            result = response.content[0].text
+            if "```python" in result:
+                result = result.split("```python")[1].split("```")[0]
+            fixed_code = result.strip()
+        except Exception as e:
+            st.error(f"Fix error: {e}")
+            return (code, False, None)
+
+    if fixed_code != code:
+        app_file.write_text(fixed_code, encoding="utf-8")
+        add_log(f"Applied fixes (loop {loop_count})")
+
+        with st.expander("View fixed code"):
+            st.code(fixed_code, language="python")
+
+        st.success("✅ Fixes applied, re-analyzing...")
+        return (fixed_code, True, issues)
+
+    st.warning("No changes made by auto-fix")
+    return (code, False, None)
+
+
+def _render_export_section(selected_project: str, code_to_test: str,
+                           all_analyses: list, loop_count: int) -> None:
+    """Render the export/download section."""
+    st.divider()
+    st.subheader("📥 Export Results")
+
+    # Fixed Code download section
+    st.markdown("### 🔧 Fixed Code")
+    st.success(f"Final code ready for download ({len(code_to_test)} characters)")
+
+    col_code1, col_code2 = st.columns(2)
+    with col_code1:
+        st.download_button(
+            "⬇️ DOWNLOAD FIXED CODE (.py)",
+            code_to_test,
+            file_name=f"{selected_project}_fixed.py",
+            mime="text/x-python",
+            type="primary"
+        )
+    with col_code2:
+        line_count = len(code_to_test.split('\n'))
+        with st.expander(f"📄 View Fixed Code ({line_count} lines)"):
+            st.code(code_to_test, language="python")
+
+    st.divider()
+
+    # Reports section
+    st.markdown("### 📊 Analysis Reports")
+
+    full_export = {
+        "project": selected_project,
+        "total_loops": loop_count,
+        "final_status": st.session_state.status,
+        "analyses": all_analyses,
+        "final_code": code_to_test,
+        "final_code_length": len(code_to_test),
+    }
+
+    col_exp1, col_exp2 = st.columns(2)
+    with col_exp1:
+        st.download_button(
+            "📥 Full Report (JSON)",
+            json.dumps(full_export, indent=2),
+            file_name=f"{selected_project}_analysis_report.json",
+            mime="application/json"
+        )
+    with col_exp2:
+        full_text = f"STREAMTEST ANALYSIS REPORT\nProject: {selected_project}\n\n"
+        for item in all_analyses:
+            full_text += format_analysis_text(item["analysis"], item["loop"]) + "\n\n"
+        full_text += "\n\n" + "=" * 60 + "\nFINAL FIXED CODE:\n" + "=" * 60 + "\n\n"
+        full_text += code_to_test
+
+        st.download_button(
+            "📥 Full Report (TXT)",
+            full_text,
+            file_name=f"{selected_project}_analysis_report.txt",
+            mime="text/plain"
+        )
+
+
+# =============================================================================
+# TEST MODE - Main function
+# =============================================================================
+
 def test_mode():
     """Test pre-built app with Claude analysis."""
     st.header("🧪 Test Only")
@@ -858,239 +1103,77 @@ def test_mode():
             loop_count += 1
             st.subheader(f"📊 Analysis Loop {loop_count}/{max_loops}")
 
+            # Run analysis
             with st.spinner(f"Claude analyzing code (attempt {loop_count})..."):
-                analysis = analyze_code_with_claude(client, code_to_test, test_steps, previous_issues if loop_count > 1 else None)
-
+                analysis = analyze_code_with_claude(
+                    client, code_to_test, test_steps,
+                    previous_issues if loop_count > 1 else None
+                )
             all_analyses.append({"loop": loop_count, "analysis": analysis})
 
-            # Display score
+            # Display results
             score = analysis.get("overall_score", 0)
-            if score >= 90:
-                st.success(f"✅ Score: {score}/100 - Excellent!")
-            elif score >= 70:
-                st.warning(f"⚠️ Score: {score}/100 - Needs improvement")
-            else:
-                st.error(f"❌ Score: {score}/100 - Significant issues")
-
-            st.progress(score / 100)
-
-            # Display issues with Expand All / Copy All buttons
             issues = analysis.get("issues", [])
 
-            if issues:
-                col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 2])
-                with col_btn1:
-                    expand_all = st.checkbox("📂 Expand All", key=f"expand_{loop_count}")
-                with col_btn2:
-                    copy_text = format_analysis_text(analysis, loop_count)
-                    st.download_button(
-                        "📋 Copy All",
-                        copy_text,
-                        file_name=f"analysis_loop_{loop_count}.txt",
-                        mime="text/plain",
-                        key=f"copy_{loop_count}"
-                    )
-
-                st.write(f"**Found {len(issues)} issue(s):**")
-
-                # Sort by severity (critical first)
-                severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-                sorted_issues = sorted(issues, key=lambda x: severity_order.get(x.get("severity", "low"), 4))
-
-                for idx, issue in enumerate(sorted_issues):
-                    severity = issue.get("severity", "low")
-                    icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(severity, "⚪")
-
-                    # Mark if this was supposedly fixed before
-                    issue_id = issue.get("id", f"issue_{idx}")
-                    fixed_marker = " (STILL PRESENT)" if issue_id in fixed_issue_ids else ""
-
-                    with st.expander(f"{icon} [{severity.upper()}] {issue.get('description', 'Unknown')[:50]}...{fixed_marker}", expanded=expand_all):
-                        st.write(f"**Category:** {issue.get('category', 'N/A')}")
-                        st.write(f"**Line:** {issue.get('line', 'N/A')}")
-                        st.write(f"**Description:** {issue.get('description', 'N/A')}")
-                        st.write(f"**Fix:** {issue.get('fix', 'N/A')}")
-                        if issue.get('code_snippet'):
-                            st.code(issue.get('code_snippet', ''), language="python")
-
-            # Display test results
-            test_results = analysis.get("test_results", [])
-            if test_results:
-                st.write("**Test Results:**")
-                for test in test_results:
-                    status = test.get("status", "unknown")
-                    icon = {"pass": "✅", "fail": "❌", "warning": "⚠️"}.get(status, "❓")
-                    st.write(f"{icon} {test.get('step', 'Unknown')} - {test.get('notes', '')}")
-
+            _render_score_indicator(score)
+            sorted_issues = _render_issues_list(analysis, loop_count, fixed_issue_ids)
+            _render_test_results(analysis.get("test_results", []))
             st.write(f"**Summary:** {analysis.get('summary', 'N/A')}")
 
-            # Store the current fixed code for later download
+            # Store for later download
             st.session_state.final_fixed_code = code_to_test
             st.session_state.final_project_name = selected_project
 
-            # Check if passing (unless run_all_loops is enabled)
-            critical_issues = [i for i in issues if i.get("severity") in ["critical", "high"]]
-
-            if not run_all_loops and score >= target_score and not critical_issues:
-                st.success(f"🎉 Code passed! Score {score} >= target {target_score}")
-                st.session_state.status = "passed"
-                add_log(f"Test PASSED: {selected_project} (score: {score})")
-                break
-            elif run_all_loops and loop_count >= max_loops:
-                st.info(f"📊 Completed all {max_loops} loops. Final score: {score}")
-                if score >= target_score:
+            # Check if we should stop
+            should_stop, message, new_status = _should_stop_analysis(
+                score, issues, target_score, run_all_loops, loop_count, max_loops
+            )
+            if should_stop:
+                if new_status == "passed":
+                    st.success(message)
                     st.session_state.status = "passed"
-                break
-
-            # Auto-fix if enabled
-            if auto_fix and issues and loop_count < max_loops:
-                if fix_one_at_time:
-                    # Fix most critical issue only
-                    issue_to_fix = sorted_issues[0]
-                    st.info(f"🔧 Fixing most critical issue: [{issue_to_fix.get('severity', 'unknown').upper()}] {issue_to_fix.get('description', '')[:50]}...")
-
-                    with st.spinner("Claude fixing this specific issue..."):
-                        fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
-
-                    if was_changed:
-                        code_to_test = fixed_code
-                        fixed_issue_ids.add(issue_to_fix.get("id", f"issue_0"))
-                        previous_issues = [issue_to_fix]  # Track what we tried to fix
-
-                        # Save fixed code
-                        app_file.write_text(fixed_code, encoding="utf-8")
-                        add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
-
-                        with st.expander("View fixed code"):
-                            st.code(fixed_code, language="python")
-
-                        st.success("✅ Fix applied, re-analyzing to verify...")
-                        continue
-                    else:
-                        st.warning("⚠️ Could not apply fix for this issue. Trying next...")
-                        # Try next issue
-                        if len(sorted_issues) > 1:
-                            issue_to_fix = sorted_issues[1]
-                            with st.spinner("Trying next issue..."):
-                                fixed_code, was_changed = auto_fix_single_issue(client, code_to_test, issue_to_fix)
-                            if was_changed:
-                                code_to_test = fixed_code
-                                app_file.write_text(fixed_code, encoding="utf-8")
-                                add_log(f"Applied fix (loop {loop_count}): {issue_to_fix.get('description', '')[:30]}...")
-                                continue
-                        break
+                    add_log(f"Test PASSED: {selected_project} (score: {score})")
                 else:
-                    # Fix all issues at once (old behavior)
-                    st.info("🔧 Auto-fixing all issues...")
-                    prompt = f"""Fix ALL these issues in the code:
-
-{json.dumps(issues, indent=2)}
-
-CURRENT CODE:
-```python
-{code_to_test}
-```
-
-Return ONLY the complete fixed Python code."""
-
-                    with st.spinner("Claude fixing code..."):
-                        try:
-                            response = client.messages.create(
-                                model=CLAUDE_MODEL,
-                                max_tokens=8000,
-                                messages=[{"role": "user", "content": prompt}]
-                            )
-                            result = response.content[0].text
-                            if "```python" in result:
-                                result = result.split("```python")[1].split("```")[0]
-                            fixed_code = result.strip()
-                        except Exception as e:
-                            st.error(f"Fix error: {e}")
-                            break
-
-                    if fixed_code != code_to_test:
-                        code_to_test = fixed_code
-                        app_file.write_text(fixed_code, encoding="utf-8")
-                        add_log(f"Applied fixes (loop {loop_count})")
-                        previous_issues = issues
-
-                        with st.expander("View fixed code"):
-                            st.code(fixed_code, language="python")
-
-                        st.success("✅ Fixes applied, re-analyzing...")
-                        continue
-                    else:
-                        st.warning("No changes made by auto-fix")
-                        break
-            else:
-                if not auto_fix:
-                    st.info("Auto-fix disabled. Enable to automatically fix issues.")
+                    st.info(message)
+                    if new_status:
+                        st.session_state.status = new_status
                 break
 
-        # Final status and export
+            # Apply fixes if enabled
+            if not auto_fix:
+                st.info("Auto-fix disabled. Enable to automatically fix issues.")
+                break
+
+            if not issues or loop_count >= max_loops:
+                break
+
+            if fix_one_at_time:
+                new_code, was_changed, issue_fixed = _apply_single_issue_fix(
+                    client, code_to_test, sorted_issues,
+                    fixed_issue_ids, app_file, loop_count
+                )
+                if was_changed:
+                    code_to_test = new_code
+                    previous_issues = [issue_fixed]
+                    continue
+                break
+            else:
+                new_code, was_changed, issues_fixed = _apply_all_issues_fix(
+                    client, code_to_test, issues, app_file, loop_count
+                )
+                if was_changed:
+                    code_to_test = new_code
+                    previous_issues = issues_fixed
+                    continue
+                break
+
+        # Final status
         if st.session_state.status != "passed":
             st.session_state.status = "failed"
             add_log(f"Test completed with issues: {selected_project}")
 
-        # Full export with all analysis data
-        st.divider()
-        st.subheader("📥 Export Results")
-
-        # MOST IMPORTANT: Download Fixed Code button
-        st.markdown("### 🔧 Fixed Code")
-        st.success(f"Final code ready for download ({len(code_to_test)} characters)")
-
-        col_code1, col_code2 = st.columns(2)
-        with col_code1:
-            st.download_button(
-                "⬇️ DOWNLOAD FIXED CODE (.py)",
-                code_to_test,
-                file_name=f"{selected_project}_fixed.py",
-                mime="text/x-python",
-                type="primary"
-            )
-        with col_code2:
-            # Show code in expander with line count
-            line_count = len(code_to_test.split('\n'))
-            with st.expander(f"📄 View Fixed Code ({line_count} lines)"):
-                st.code(code_to_test, language="python")
-
-        st.divider()
-
-        # Reports section
-        st.markdown("### 📊 Analysis Reports")
-
-        full_export = {
-            "project": selected_project,
-            "total_loops": loop_count,
-            "final_status": st.session_state.status,
-            "analyses": all_analyses,
-            "final_code": code_to_test,  # Include the actual fixed code
-            "final_code_length": len(code_to_test),
-        }
-
-        col_exp1, col_exp2 = st.columns(2)
-        with col_exp1:
-            st.download_button(
-                "📥 Full Report (JSON)",
-                json.dumps(full_export, indent=2),
-                file_name=f"{selected_project}_analysis_report.json",
-                mime="application/json"
-            )
-        with col_exp2:
-            # Text report
-            full_text = f"STREAMTEST ANALYSIS REPORT\nProject: {selected_project}\n\n"
-            for item in all_analyses:
-                full_text += format_analysis_text(item["analysis"], item["loop"]) + "\n\n"
-            full_text += "\n\n" + "=" * 60 + "\nFINAL FIXED CODE:\n" + "=" * 60 + "\n\n"
-            full_text += code_to_test
-
-            st.download_button(
-                "📥 Full Report (TXT)",
-                full_text,
-                file_name=f"{selected_project}_analysis_report.txt",
-                mime="text/plain"
-            )
+        # Render export section
+        _render_export_section(selected_project, code_to_test, all_analyses, loop_count)
 
 
 # =============================================================================
